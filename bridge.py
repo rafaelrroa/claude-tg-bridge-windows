@@ -239,6 +239,10 @@ class UserState:
 user_state: dict[str, UserState] = {}
 start_time = time.monotonic()
 
+# Media group buffering: media_group_id -> {images: [...], caption: str, update: Update, timer: Task}
+media_group_buffer: dict[str, dict] = {}
+MEDIA_GROUP_WAIT = 1.5  # seconds to wait for more photos in an album
+
 # ── Helpers ──────────────────────────────────────────────────────────
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
@@ -697,31 +701,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     asyncio.create_task(run_and_drain(update, prompt, uid, state))
 
 
-async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
-    if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("Unauthorized")
-        return
-
+async def _download_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
+    """Download the highest-res photo from a message and return its path."""
     photo = update.message.photo[-1]
-    caption = update.message.caption or ""
-
     file = await context.bot.get_file(photo.file_id)
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
     image_path = IMAGE_DIR / f"photo_{timestamp}_{photo.file_unique_id}.jpg"
     await file.download_to_drive(str(image_path))
     logger.info("Downloaded image to %s", image_path)
+    return image_path
 
-    if caption:
-        prompt = (
-            f"I've sent you an image saved at {image_path}. "
-            f"Please read/view this image file and then: {caption}"
-        )
+
+async def _submit_photos(
+    uid: str, image_paths: list[Path], caption: str, update: Update
+) -> None:
+    """Build a combined prompt from multiple images and submit to Claude."""
+    paths_str = ", ".join(str(p) for p in image_paths)
+    if len(image_paths) == 1:
+        if caption:
+            prompt = (
+                f"I've sent you an image saved at {image_paths[0]}. "
+                f"Please read/view this image file and then: {caption}"
+            )
+        else:
+            prompt = (
+                f"I've sent you an image saved at {image_paths[0]}. "
+                "Please read/view this image file and analyze what you see."
+            )
     else:
-        prompt = (
-            f"I've sent you an image saved at {image_path}. "
-            "Please read/view this image file and analyze what you see."
-        )
+        file_list = "\n".join(f"  - {p}" for p in image_paths)
+        if caption:
+            prompt = (
+                f"I've sent you {len(image_paths)} images saved at:\n{file_list}\n"
+                f"Please read/view all these image files and then: {caption}"
+            )
+        else:
+            prompt = (
+                f"I've sent you {len(image_paths)} images saved at:\n{file_list}\n"
+                "Please read/view all these image files and analyze what you see."
+            )
 
     state = user_state.setdefault(uid, UserState())
 
@@ -730,13 +748,65 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         state.queue.append(prompt)
         pos = len(state.queue)
         await update.message.reply_text(
-            f"Image queued (position {pos}). Use /stop to cancel current."
+            f"Image(s) queued (position {pos}). Use /stop to cancel current."
         )
         return
     state.busy = True
     # ── END CRITICAL SECTION ─────────────────────────────────────
 
     asyncio.create_task(run_and_drain(update, prompt, uid, state))
+
+
+async def _flush_media_group(group_id: str) -> None:
+    """Called after MEDIA_GROUP_WAIT — submit all buffered photos as one prompt."""
+    group = media_group_buffer.pop(group_id, None)
+    if not group:
+        return
+    await _submit_photos(
+        group["uid"], group["images"], group["caption"], group["update"]
+    )
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    uid = str(update.effective_user.id)
+    if not is_authorized(update.effective_user.id):
+        await update.message.reply_text("Unauthorized")
+        return
+
+    image_path = await _download_photo(update, context)
+    caption = update.message.caption or ""
+    group_id = update.message.media_group_id
+
+    # Single photo (no album) — submit immediately
+    if not group_id:
+        await _submit_photos(uid, [image_path], caption, update)
+        return
+
+    # Album photo — buffer and wait for more
+    if group_id in media_group_buffer:
+        # Add to existing group
+        group = media_group_buffer[group_id]
+        group["images"].append(image_path)
+        if caption and not group["caption"]:
+            group["caption"] = caption
+        # Reset the timer
+        group["timer"].cancel()
+        group["timer"] = asyncio.get_event_loop().call_later(
+            MEDIA_GROUP_WAIT,
+            lambda gid=group_id: asyncio.create_task(_flush_media_group(gid)),
+        )
+    else:
+        # First photo in this group
+        media_group_buffer[group_id] = {
+            "uid": uid,
+            "images": [image_path],
+            "caption": caption,
+            "update": update,
+            "timer": asyncio.get_event_loop().call_later(
+                MEDIA_GROUP_WAIT,
+                lambda gid=group_id: asyncio.create_task(_flush_media_group(gid)),
+            ),
+        }
 
 
 # ── Callback Handler ─────────────────────────────────────────────────
