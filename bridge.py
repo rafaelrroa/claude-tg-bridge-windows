@@ -43,7 +43,7 @@ ALLOWED_USERS = {
     for x in os.environ.get("ALLOWED_USERS", "126414160").split(",")
     if x.strip()
 }
-DEFAULT_WORKING_DIR = os.environ.get("WORKING_DIR", "/root/memfun")
+DEFAULT_WORKING_DIR = os.environ.get("WORKING_DIR", os.path.expanduser("~"))
 DB_PATH = Path(os.environ.get("BRIDGE_DB", "sessions.db"))
 MAX_MSG_LEN = 4000
 STREAM_INTERVAL = 3  # seconds between Telegram message flushes
