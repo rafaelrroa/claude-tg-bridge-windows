@@ -1,0 +1,14 @@
+[Unit]
+Description=Claude Code Telegram Bridge
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/claude-tg-bridge
+ExecStart=/root/claude-tg-bridge/venv/bin/python bridge.py
+Restart=always
+RestartSec=5
+EnvironmentFile=/root/claude-tg-bridge/.env
+
+[Install]
+WantedBy=multi-user.target
