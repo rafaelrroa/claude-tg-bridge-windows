@@ -323,7 +323,7 @@ async def run_claude_streaming(
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
         cwd=working_dir,
         env=env,
         limit=10 * 1024 * 1024,
@@ -408,8 +408,11 @@ async def run_claude_streaming(
 
     finally:
         state.process = None
-        with contextlib.suppress(Exception):
-            await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except (asyncio.TimeoutError, Exception):
+            with contextlib.suppress(Exception):
+                process.kill()
         await flush_buffer()
 
         if new_session_id:
