@@ -326,11 +326,17 @@ def is_authorized(user_id: int) -> bool:
 
 
 def is_chat_allowed(chat) -> bool:
-    """Check if a group/supergroup chat is in the allow-list (private always OK)."""
+    """Check if a chat is allowed.
+
+    Private chats are always allowed.
+    Groups/supergroups require an explicit entry in ALLOWED_CHATS;
+    if the list is empty, all group access is denied.
+    """
     if chat.type == "private":
         return True
     if not ALLOWED_CHATS:
-        return True
+        logger.warning("Group chat %s blocked: ALLOWED_CHATS is empty", chat.id)
+        return False
     return chat.id in ALLOWED_CHATS
 
 
