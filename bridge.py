@@ -57,6 +57,7 @@ ALLOWED_CHATS = {
     if x.strip()
 }
 DEFAULT_WORKING_DIR = os.environ.get("WORKING_DIR", os.path.expanduser("~"))
+ROOT_DIR = Path(DEFAULT_WORKING_DIR).resolve()  # sandbox root — users cannot cd above this
 DB_PATH = Path(os.environ.get("BRIDGE_DB", "sessions.db"))
 MAX_MSG_LEN = 4000
 STREAM_INTERVAL = 3  # seconds between Telegram message flushes
@@ -328,6 +329,15 @@ def is_chat_allowed(chat) -> bool:
     if not ALLOWED_CHATS:
         return True
     return chat.id in ALLOWED_CHATS
+
+
+def is_within_root(path: str) -> bool:
+    """Return True if path is inside ROOT_DIR (sandbox boundary)."""
+    try:
+        Path(path).resolve().relative_to(ROOT_DIR)
+        return True
+    except ValueError:
+        return False
 
 
 def get_conv_key(update: Update) -> str:
@@ -729,6 +739,12 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not os.path.isabs(resolved):
         resolved = os.path.join(get_working_dir(conv_key), resolved)
     resolved = os.path.normpath(resolved)
+    if not is_within_root(resolved):
+        await update.message.reply_text(
+            f"Access denied: path is outside the allowed root `{ROOT_DIR}`",
+            parse_mode="Markdown",
+        )
+        return
     if not os.path.isdir(resolved):
         await update.message.reply_text(f"Not a directory: `{resolved}`", parse_mode="Markdown")
         return
@@ -755,6 +771,12 @@ async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not os.path.isabs(target):
         target = os.path.join(wd, target)
     target = os.path.normpath(target)
+    if not is_within_root(target):
+        await update.message.reply_text(
+            f"Access denied: path is outside the allowed root `{ROOT_DIR}`",
+            parse_mode="Markdown",
+        )
+        return
     if not os.path.isdir(target):
         await update.message.reply_text(f"Not a directory: `{target}`", parse_mode="Markdown")
         return
