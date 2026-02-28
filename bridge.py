@@ -308,11 +308,14 @@ async def send_safe(
         try:
             await update.message.reply_text(chunk, parse_mode=parse_mode)
         except Exception:
+            logger.warning("send_safe: Markdown send failed, retrying as plain text", exc_info=True)
             clean = chunk.replace("_", "").replace("*", "").replace("`", "")
             try:
                 await update.message.reply_text(clean)
             except Exception:
-                await update.message.reply_text(clean[:3900] + "...(truncated)")
+                logger.warning("send_safe: plain send failed, truncating", exc_info=True)
+                with contextlib.suppress(Exception):
+                    await update.message.reply_text(clean[:3900] + "...(truncated)")
 
 
 def is_authorized(user_id: int) -> bool:
@@ -882,7 +885,14 @@ async def _submit_photos(
     state.busy = True
     # ── END CRITICAL SECTION ─────────────────────────────────────
 
-    asyncio.create_task(run_and_drain(update, prompt, conv_key, state))
+    async def _run_and_cleanup() -> None:
+        await run_and_drain(update, prompt, conv_key, state)
+        for p in image_paths:
+            with contextlib.suppress(OSError):
+                p.unlink()
+                logger.debug("Deleted temp image %s", p)
+
+    asyncio.create_task(_run_and_cleanup())
 
 
 async def _flush_media_group(group_id: str) -> None:
