@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Claude Code Telegram Bridge v15.
+"""Claude Code Telegram Bridge v16.
 
 Single-file Telegram bot that proxies messages to Claude CLI subprocesses.
 Streaming responses, session management, image support, per-user working dirs.
 
-v15 fixes: race conditions via atomic busy flag, iterative queue drain,
-proper error handling, graceful shutdown, log rotation.
+v16: Forum topics support — each topic gets its own session, model, and working
+directory.  Private chats continue to work as before.
 """
 from __future__ import annotations
+
+from dotenv import load_dotenv
+load_dotenv()
 
 import asyncio
 import contextlib
@@ -17,12 +20,17 @@ import os
 import re
 import signal
 import sqlite3
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
+
+IS_WINDOWS = sys.platform == "win32"
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -36,11 +44,16 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "15.0.0"
+VERSION = "16.0.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
     for x in os.environ.get("ALLOWED_USERS", "126414160").split(",")
+    if x.strip()
+}
+ALLOWED_CHATS = {
+    int(x)
+    for x in os.environ.get("ALLOWED_CHATS", "").split(",")
     if x.strip()
 }
 DEFAULT_WORKING_DIR = os.environ.get("WORKING_DIR", os.path.expanduser("~"))
@@ -49,7 +62,7 @@ MAX_MSG_LEN = 4000
 STREAM_INTERVAL = 3  # seconds between Telegram message flushes
 READLINE_TIMEOUT = 0.3  # seconds — how often to check cancellation
 PROCESS_TIMEOUT = 3600  # 1 hour max per Claude invocation
-IMAGE_DIR = Path("/tmp/tg_images")
+IMAGE_DIR = Path(tempfile.gettempdir()) / "tg_images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_TOOLS = [
@@ -162,6 +175,19 @@ def get_current_session(uid: str) -> str | None:
     return row[0] if row else None
 
 
+def get_latest_session(uid: str) -> str | None:
+    """Return the most recently used session for this conv_key (ignoring is_current)."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute(
+        "SELECT session_id FROM sessions WHERE user_id = ? ORDER BY last_used DESC LIMIT 1",
+        (uid,),
+    )
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
 def set_current_session(uid: str, session_id: str, description: str = "") -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     c = conn.cursor()
@@ -234,6 +260,7 @@ class UserState:
     queue: list[str] = field(default_factory=list)
     cancelled: bool = False
     busy: bool = False
+    force_new: bool = False
 
 
 user_state: dict[str, UserState] = {}
@@ -288,7 +315,41 @@ async def send_safe(
 
 
 def is_authorized(user_id: int) -> bool:
-    return user_id in ALLOWED_USERS
+    if user_id not in ALLOWED_USERS:
+        logger.warning("Unauthorized user_id=%d (allowed: %s)", user_id, ALLOWED_USERS)
+        return False
+    return True
+
+
+def is_chat_allowed(chat) -> bool:
+    """Check if a group/supergroup chat is in the allow-list (private always OK)."""
+    if chat.type == "private":
+        return True
+    if not ALLOWED_CHATS:
+        return True
+    return chat.id in ALLOWED_CHATS
+
+
+def get_conv_key(update: Update) -> str:
+    """Derive conversation key: per-user in private, per-topic in forums, per-chat in groups."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if chat.type == "private":
+        return str(update.effective_user.id)
+    if getattr(chat, "is_forum", False) and msg and getattr(msg, "message_thread_id", None):
+        return f"{chat.id}:{msg.message_thread_id}"
+    return str(chat.id)
+
+
+def get_conv_key_from_callback(query) -> str:
+    """Derive conversation key from an inline-button callback query."""
+    chat = query.message.chat
+    msg = query.message
+    if chat.type == "private":
+        return str(query.from_user.id)
+    if getattr(chat, "is_forum", False) and msg and getattr(msg, "message_thread_id", None):
+        return f"{chat.id}:{msg.message_thread_id}"
+    return str(chat.id)
 
 
 # ── Claude Subprocess + Streaming ────────────────────────────────────
@@ -299,11 +360,12 @@ async def run_claude_streaming(
     prompt: str,
     session_id: str | None,
     model: str,
-    uid: str,
+    conv_key: str,
     state: UserState,
+    auto_continue: bool = False,
 ) -> None:
     """Spawn claude --print and stream responses back to Telegram."""
-    working_dir = get_working_dir(uid)
+    working_dir = get_working_dir(conv_key)
 
     cmd = [
         "claude", "--print", "--output-format", "stream-json",
@@ -313,12 +375,21 @@ async def run_claude_streaming(
     if session_id:
         cmd.extend(["--resume", session_id])
         logger.info("Resuming session: %s...", session_id[:8])
+    elif auto_continue:
+        cmd.append("--continue")
+        logger.info("Auto-continuing last session in %s", working_dir)
     else:
         logger.info("Starting new session")
     cmd.extend(["--", prompt])
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+
+    popen_kwargs: dict[str, Any] = {}
+    if IS_WINDOWS:
+        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        popen_kwargs["start_new_session"] = True
 
     process = await asyncio.create_subprocess_exec(
         *cmd,
@@ -327,7 +398,7 @@ async def run_claude_streaming(
         cwd=working_dir,
         env=env,
         limit=10 * 1024 * 1024,
-        start_new_session=True,
+        **popen_kwargs,
     )
     state.process = process
 
@@ -347,7 +418,7 @@ async def run_claude_streaming(
     try:
         while True:
             if state.cancelled:
-                logger.info("Cancellation detected for %s", uid)
+                logger.info("Cancellation detected for %s", conv_key)
                 await flush_buffer()
                 break
 
@@ -417,7 +488,7 @@ async def run_claude_streaming(
 
         if new_session_id:
             try:
-                set_current_session(uid, new_session_id, prompt[:100])
+                set_current_session(conv_key, new_session_id, prompt[:100])
             except Exception:
                 logger.warning("Failed to save session", exc_info=True)
             await update.message.reply_text(
@@ -428,7 +499,7 @@ async def run_claude_streaming(
 async def run_and_drain(
     update: Update,
     initial_prompt: str,
-    uid: str,
+    conv_key: str,
     state: UserState,
 ) -> None:
     """Run Claude for initial_prompt, then drain queued messages iteratively."""
@@ -436,18 +507,32 @@ async def run_and_drain(
 
     while prompt is not None:
         state.cancelled = False
-        model = get_user_model(uid)
-        session_id = get_current_session(uid)
+        model = get_user_model(conv_key)
+        session_id = get_current_session(conv_key)
+        auto_continue = False
+        if not session_id and not state.force_new:
+            session_id = get_latest_session(conv_key)
+            if session_id:
+                logger.info("Auto-resuming latest session %s for %s", session_id[:8], conv_key)
+            else:
+                auto_continue = True
+        state.force_new = False
 
-        status_text = f"({session_id[:8]}...)" if session_id else "(new)"
+        if session_id:
+            status_text = f"({session_id[:8]}...)"
+        elif auto_continue:
+            status_text = "(continue)"
+        else:
+            status_text = "(new)"
         await update.message.reply_text(f"Claude {model} {status_text}...")
 
         try:
             await run_claude_streaming(
-                update, prompt, session_id, model, uid, state
+                update, prompt, session_id, model, conv_key, state,
+                auto_continue=auto_continue,
             )
         except Exception:
-            logger.exception("Claude process failed for user %s", uid)
+            logger.exception("Claude process failed for conv %s", conv_key)
             await update.message.reply_text("Claude process failed. Try again.")
 
         # Drain next from queue
@@ -470,13 +555,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized")
         return
-    uid = str(update.effective_user.id)
-    model = get_user_model(uid)
-    session_id = get_current_session(uid)
-    history = get_session_history(uid)
-    state = user_state.get(uid)
+    if not is_chat_allowed(update.effective_chat):
+        return
+    conv_key = get_conv_key(update)
+    model = get_user_model(conv_key)
+    session_id = get_current_session(conv_key)
+    history = get_session_history(conv_key)
+    state = user_state.get(conv_key)
     is_running = state.busy if state else False
-    wd = get_working_dir(uid)
+    wd = get_working_dir(conv_key)
 
     await update.message.reply_text(
         f"*Claude Bridge v{VERSION}*\n\n"
@@ -499,12 +586,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
+    if not is_chat_allowed(update.effective_chat):
+        return
+    conv_key = get_conv_key(update)
 
-    logger.info("/stop received from %s", uid)
-    state = user_state.get(uid)
+    logger.info("/stop received from %s", conv_key)
+    state = user_state.get(conv_key)
 
     if not state or not state.busy:
         await update.message.reply_text("Nothing running")
@@ -517,9 +606,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     process = state.process
     if process and process.returncode is None:
         try:
-            pgid = os.getpgid(process.pid)
-            logger.info("Killing process group %d", pgid)
-            os.killpg(pgid, signal.SIGKILL)
+            _kill_process_tree(process)
         except ProcessLookupError:
             logger.info("Process already dead")
         except Exception as e:
@@ -534,43 +621,51 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_haiku(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
-    set_user_model(uid, "haiku")
+    if not is_chat_allowed(update.effective_chat):
+        return
+    set_user_model(get_conv_key(update), "haiku")
     await update.message.reply_text("Switched to *Haiku*", parse_mode="Markdown")
 
 
 async def cmd_sonnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
-    set_user_model(uid, "sonnet")
+    if not is_chat_allowed(update.effective_chat):
+        return
+    set_user_model(get_conv_key(update), "sonnet")
     await update.message.reply_text("Switched to *Sonnet*", parse_mode="Markdown")
 
 
 async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
-    set_user_model(uid, "opus")
+    if not is_chat_allowed(update.effective_chat):
+        return
+    set_user_model(get_conv_key(update), "opus")
     await update.message.reply_text("Switched to *Opus*", parse_mode="Markdown")
 
 
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
-    clear_current_session(uid)
+    if not is_chat_allowed(update.effective_chat):
+        return
+    conv_key = get_conv_key(update)
+    clear_current_session(conv_key)
+    state = user_state.setdefault(conv_key, UserState())
+    state.force_new = True
     await update.message.reply_text("Started new conversation")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
+    if not is_chat_allowed(update.effective_chat):
+        return
 
-    history = get_session_history(uid, 15)
+    history = get_session_history(get_conv_key(update), 15)
     if not history:
         await update.message.reply_text("No session history yet")
         return
@@ -592,15 +687,17 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
-    model = get_user_model(uid)
-    session_id = get_current_session(uid)
-    state = user_state.get(uid)
+    if not is_chat_allowed(update.effective_chat):
+        return
+    conv_key = get_conv_key(update)
+    model = get_user_model(conv_key)
+    session_id = get_current_session(conv_key)
+    state = user_state.get(conv_key)
     is_running = state.busy if state else False
     queued = len(state.queue) if state else 0
-    wd = get_working_dir(uid)
+    wd = get_working_dir(conv_key)
     uptime = int(time.monotonic() - start_time)
     uptime_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
 
@@ -618,38 +715,42 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
+    if not is_chat_allowed(update.effective_chat):
+        return
+    conv_key = get_conv_key(update)
     if not context.args:
-        wd = get_working_dir(uid)
+        wd = get_working_dir(conv_key)
         await update.message.reply_text(f"Current: `{wd}`\nUsage: /cd <path>", parse_mode="Markdown")
         return
     path = " ".join(context.args)
     resolved = os.path.expanduser(path)
     if not os.path.isabs(resolved):
-        resolved = os.path.join(get_working_dir(uid), resolved)
+        resolved = os.path.join(get_working_dir(conv_key), resolved)
     resolved = os.path.normpath(resolved)
     if not os.path.isdir(resolved):
         await update.message.reply_text(f"Not a directory: `{resolved}`", parse_mode="Markdown")
         return
-    set_working_dir(uid, resolved)
+    set_working_dir(conv_key, resolved)
     await update.message.reply_text(f"Working directory: `{resolved}`", parse_mode="Markdown")
 
 
 async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
-    wd = get_working_dir(uid)
+    if not is_chat_allowed(update.effective_chat):
+        return
+    wd = get_working_dir(get_conv_key(update))
     await update.message.reply_text(f"`{wd}`", parse_mode="Markdown")
 
 
 async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         return
-    wd = get_working_dir(uid)
+    if not is_chat_allowed(update.effective_chat):
+        return
+    wd = get_working_dir(get_conv_key(update))
     target = " ".join(context.args) if context.args else wd
     if not os.path.isabs(target):
         target = os.path.join(wd, target)
@@ -672,9 +773,10 @@ async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized")
+        return
+    if not is_chat_allowed(update.effective_chat):
         return
 
     prompt = update.message.text
@@ -686,7 +788,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await cmd_stop(update, context)
         return
 
-    state = user_state.setdefault(uid, UserState())
+    conv_key = get_conv_key(update)
+    state = user_state.setdefault(conv_key, UserState())
 
     # ── CRITICAL SECTION ─────────────────────────────────────────
     # No `await` between the check and set. This is atomic within
@@ -701,7 +804,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     state.busy = True
     # ── END CRITICAL SECTION ─────────────────────────────────────
 
-    asyncio.create_task(run_and_drain(update, prompt, uid, state))
+    asyncio.create_task(run_and_drain(update, prompt, conv_key, state))
 
 
 async def _download_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Path:
@@ -716,7 +819,7 @@ async def _download_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def _submit_photos(
-    uid: str, image_paths: list[Path], caption: str, update: Update
+    conv_key: str, image_paths: list[Path], caption: str, update: Update
 ) -> None:
     """Build a combined prompt from multiple images and submit to Claude."""
     paths_str = ", ".join(str(p) for p in image_paths)
@@ -744,7 +847,7 @@ async def _submit_photos(
                 "Please read/view all these image files and analyze what you see."
             )
 
-    state = user_state.setdefault(uid, UserState())
+    state = user_state.setdefault(conv_key, UserState())
 
     # ── CRITICAL SECTION (same pattern as handle_message) ────────
     if state.busy:
@@ -757,7 +860,7 @@ async def _submit_photos(
     state.busy = True
     # ── END CRITICAL SECTION ─────────────────────────────────────
 
-    asyncio.create_task(run_and_drain(update, prompt, uid, state))
+    asyncio.create_task(run_and_drain(update, prompt, conv_key, state))
 
 
 async def _flush_media_group(group_id: str) -> None:
@@ -766,23 +869,25 @@ async def _flush_media_group(group_id: str) -> None:
     if not group:
         return
     await _submit_photos(
-        group["uid"], group["images"], group["caption"], group["update"]
+        group["conv_key"], group["images"], group["caption"], group["update"]
     )
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = str(update.effective_user.id)
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized")
         return
+    if not is_chat_allowed(update.effective_chat):
+        return
 
+    conv_key = get_conv_key(update)
     image_path = await _download_photo(update, context)
     caption = update.message.caption or ""
     group_id = update.message.media_group_id
 
     # Single photo (no album) — submit immediately
     if not group_id:
-        await _submit_photos(uid, [image_path], caption, update)
+        await _submit_photos(conv_key, [image_path], caption, update)
         return
 
     # Album photo — buffer and wait for more
@@ -801,7 +906,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     else:
         # First photo in this group
         media_group_buffer[group_id] = {
-            "uid": uid,
+            "conv_key": conv_key,
             "images": [image_path],
             "caption": caption,
             "update": update,
@@ -817,14 +922,16 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    uid = str(query.from_user.id)
     if not is_authorized(query.from_user.id):
         await query.answer("Unauthorized")
+        return
+    if not is_chat_allowed(query.message.chat):
         return
 
     if query.data and query.data.startswith("resume:"):
         session_id = query.data[7:]
-        set_current_session(uid, session_id)
+        conv_key = get_conv_key_from_callback(query)
+        set_current_session(conv_key, session_id)
         await query.answer("Resumed")
         await query.edit_message_text(
             f"Resumed session:\n`{session_id}`", parse_mode="Markdown"
@@ -847,14 +954,26 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ── Graceful Shutdown ────────────────────────────────────────────────
 
 
+def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
+    """Kill a process and all its children, cross-platform."""
+    pid = process.pid
+    if IS_WINDOWS:
+        # taskkill /T kills the entire process tree
+        logger.info("Killing process tree %d (taskkill)", pid)
+        os.system(f"taskkill /F /T /PID {pid} >NUL 2>&1")
+    else:
+        pgid = os.getpgid(pid)
+        logger.info("Killing process group %d", pgid)
+        os.killpg(pgid, signal.SIGKILL)
+
+
 async def shutdown_cleanup(app: Application) -> None:
     """Kill all running Claude processes on shutdown."""
-    for uid, state in user_state.items():
+    for conv_key, state in user_state.items():
         if state.process and state.process.returncode is None:
-            logger.info("Shutting down: killing process for user %s", uid)
+            logger.info("Shutting down: killing process for %s", conv_key)
             with contextlib.suppress(Exception):
-                pgid = os.getpgid(state.process.pid)
-                os.killpg(pgid, signal.SIGTERM)
+                _kill_process_tree(state.process)
             with contextlib.suppress(Exception):
                 await asyncio.wait_for(state.process.wait(), timeout=3.0)
             with contextlib.suppress(Exception):
