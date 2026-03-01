@@ -769,12 +769,30 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # ── Normal (non-forum) mode: reset session in current chat ──────────
+    # ── Normal (non-forum) mode: reset session, optionally set working dir ──
     conv_key = get_conv_key(update)
     clear_current_session(conv_key)
     state = user_state.setdefault(conv_key, UserState())
     state.force_new = True
-    await update.message.reply_text("Started new conversation")
+
+    if context.args:
+        folder = " ".join(context.args)
+        if os.path.isabs(folder):
+            resolved = os.path.normpath(folder)
+        else:
+            resolved = os.path.normpath(os.path.join(ROOT_DIR, folder))
+        if is_within_root(resolved) and os.path.isdir(resolved):
+            set_working_dir(conv_key, resolved)
+            await update.message.reply_text(
+                f"New conversation — 📁 `{resolved}`", parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"New conversation — folder not found, keeping `{get_working_dir(conv_key)}`",
+                parse_mode="Markdown",
+            )
+    else:
+        await update.message.reply_text("New conversation")
 
 
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
