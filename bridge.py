@@ -44,7 +44,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "16.2.0"
+VERSION = "16.3.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -311,6 +311,7 @@ MEDIA_GROUP_WAIT = 1.5  # seconds to wait for more photos in an album
 # ── Helpers ──────────────────────────────────────────────────────────
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 # Matches a full GFM table: header row | separator row | one or more data rows
 _TABLE_RE = re.compile(
@@ -818,6 +819,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Sessions*\n"
         "/new [folder] — New session; in forum creates a topic\n"
         "/history — Browse and resume past sessions\n"
+        "/resume <id> [folder] — Attach an external CLI session\n"
         "/stop — Cancel the running task\n"
         "/status — Model, session ID, uptime, working dir\n\n"
         "*Models*\n"
@@ -1050,6 +1052,107 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
+
+
+async def cmd_resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/resume <session_id> [folder] — attach an external Claude session to this chat.
+
+    Private / sub-topic: just registers the session_id as current.
+    Foundational forum chat: requires a folder; creates a new topic and sets the session there.
+    """
+    if not is_authorized(update.effective_user.id):
+        return
+    if not is_chat_allowed(update.effective_chat):
+        return
+    _log_cmd(update, "resume")
+
+    if not context.args:
+        await update.message.reply_text(
+            "*Usage*\n"
+            "`/resume <session_id>` — private chat or topic\n"
+            "`/resume <session_id> <folder>` — foundational chat (creates a topic)\n\n"
+            "Find your session ID in the Claude CLI output or `~/.claude/projects/`.",
+            parse_mode="Markdown",
+        )
+        return
+
+    session_id = context.args[0]
+    if not _UUID_RE.match(session_id):
+        await update.message.reply_text(
+            "Invalid session ID — expected a UUID like `abc12345-1234-...`",
+            parse_mode="Markdown",
+        )
+        return
+
+    chat = update.effective_chat
+    foundational = is_foundational_chat(update)
+
+    if foundational and getattr(chat, "is_forum", False):
+        # Foundational forum chat: need a folder to create a topic
+        if len(context.args) < 2:
+            await update.message.reply_text(
+                "From the foundational chat, a folder is required:\n"
+                "`/resume <session_id> <folder>`\n\n"
+                "A new topic will be created for that folder.",
+                parse_mode="Markdown",
+            )
+            return
+
+        folder = " ".join(context.args[1:])
+        if os.path.isabs(folder):
+            resolved = os.path.normpath(folder)
+        else:
+            resolved = os.path.normpath(os.path.join(ROOT_DIR, folder))
+
+        if not is_within_root(resolved):
+            await update.message.reply_text(
+                f"Folder must be within `{ROOT_DIR}`.", parse_mode="Markdown"
+            )
+            return
+        if not os.path.isdir(resolved):
+            await update.message.reply_text(
+                f"Folder not found: `{resolved}`", parse_mode="Markdown"
+            )
+            return
+
+        topic_name = (os.path.basename(resolved.rstrip("/\\")) or "session")[:128]
+        try:
+            topic = await context.bot.create_forum_topic(chat_id=chat.id, name=topic_name)
+        except Exception as e:
+            logger.error("create_forum_topic failed: %s", e)
+            await update.message.reply_text(f"Could not create topic: {e}")
+            return
+
+        new_thread_id = topic.message_thread_id
+        conv_key = f"{chat.id}:{new_thread_id}"
+        set_working_dir(conv_key, resolved)
+        set_home_dir(conv_key, resolved)
+        set_current_session(conv_key, session_id, "external session")
+
+        await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=new_thread_id,
+            text=(
+                f"*{topic_name}*\n"
+                f"\U0001f4c1 `{resolved}`\n\n"
+                f"Session `{session_id[:16]}...` ready."
+            ),
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(
+            f"Created topic *{topic_name}* with session `{session_id[:16]}...`.",
+            parse_mode="Markdown",
+        )
+
+    else:
+        # Private chat, sub-topic, or non-forum group: just register the session
+        conv_key = get_conv_key(update)
+        set_current_session(conv_key, session_id, "external session")
+        await update.message.reply_text(
+            f"Session `{session_id[:16]}...` set as current.\n"
+            "Your next message will resume it.",
+            parse_mode="Markdown",
+        )
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1547,6 +1650,7 @@ def main() -> None:
     app.add_handler(CommandHandler("opus", cmd_opus))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("history", cmd_history))
+    app.add_handler(CommandHandler("resume", cmd_resume_session))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cd", cmd_nav))
     app.add_handler(CommandHandler("pwd", cmd_pwd))
