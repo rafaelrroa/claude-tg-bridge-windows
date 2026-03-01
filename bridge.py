@@ -44,7 +44,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "16.3.0"
+VERSION = "16.4.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -312,6 +312,23 @@ MEDIA_GROUP_WAIT = 1.5  # seconds to wait for more photos in an album
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _claude_session_exists(session_id: str, working_dir: str) -> bool:
+    """Check if session_id exists in Claude's local projects storage for working_dir.
+
+    Claude CLI stores sessions as:
+      ~/.claude/projects/<encoded-path>/<uuid>.jsonl
+    where <encoded-path> replaces '/', '\\', and ':' with '-'.
+    """
+    claude_projects = Path.home() / ".claude" / "projects"
+    if not claude_projects.is_dir():
+        return False
+    encoded = "".join("-" if ch in "/\\:" else ch for ch in working_dir)
+    project_dir = claude_projects / encoded
+    if not project_dir.is_dir():
+        return False
+    return (project_dir / f"{session_id}.jsonl").exists()
 
 # Matches a full GFM table: header row | separator row | one or more data rows
 _TABLE_RE = re.compile(
@@ -819,7 +836,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "*Sessions*\n"
         "/new [folder] — New session; in forum creates a topic\n"
         "/history — Browse and resume past sessions\n"
-        "/resume <id> [folder] — Attach an external CLI session\n"
+        "/resume <id> — Attach an external CLI session\n"
         "/stop — Cancel the running task\n"
         "/status — Model, session ID, uptime, working dir\n\n"
         "*Models*\n"
@@ -1069,8 +1086,9 @@ async def cmd_resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not context.args:
         await update.message.reply_text(
             "*Usage*\n"
-            "`/resume <session_id>` — private chat or topic\n"
-            "`/resume <session_id> <folder>` — foundational chat (creates a topic)\n\n"
+            "`/resume <session_id>` — attach a Claude CLI session to this chat\n\n"
+            "From the foundational chat: navigate to the project folder with /cd first,\n"
+            "then run /resume — a new topic will be created for that session.\n\n"
             "Find your session ID in the Claude CLI output or `~/.claude/projects/`.",
             parse_mode="Markdown",
         )
@@ -1088,33 +1106,28 @@ async def cmd_resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE)
     foundational = is_foundational_chat(update)
 
     if foundational and getattr(chat, "is_forum", False):
-        # Foundational forum chat: need a folder to create a topic
-        if len(context.args) < 2:
+        # Foundational forum chat: use current working dir (set via /cd navigation)
+        conv_key_hub = get_conv_key(update)
+        working_dir = get_working_dir(conv_key_hub)
+
+        # Guard: user must have navigated away from ROOT_DIR first
+        if Path(working_dir).resolve() == ROOT_DIR:
             await update.message.reply_text(
-                "From the foundational chat, a folder is required:\n"
-                "`/resume <session_id> <folder>`\n\n"
-                "A new topic will be created for that folder.",
+                "Navigate to a project folder first with /cd, then run /resume."
+            )
+            return
+
+        # Verify the session exists in Claude's storage for this directory
+        if not _claude_session_exists(session_id, working_dir):
+            display = format_bot_path(working_dir, str(ROOT_DIR))
+            await update.message.reply_text(
+                f"Session not found under `{display}`.\n"
+                "Make sure you navigated to the correct project with /cd first.",
                 parse_mode="Markdown",
             )
             return
 
-        folder = " ".join(context.args[1:])
-        if os.path.isabs(folder):
-            resolved = os.path.normpath(folder)
-        else:
-            resolved = os.path.normpath(os.path.join(ROOT_DIR, folder))
-
-        if not is_within_root(resolved):
-            await update.message.reply_text(
-                f"Folder must be within `{ROOT_DIR}`.", parse_mode="Markdown"
-            )
-            return
-        if not os.path.isdir(resolved):
-            await update.message.reply_text(
-                f"Folder not found: `{resolved}`", parse_mode="Markdown"
-            )
-            return
-
+        resolved = working_dir
         topic_name = (os.path.basename(resolved.rstrip("/\\")) or "session")[:128]
         try:
             topic = await context.bot.create_forum_topic(chat_id=chat.id, name=topic_name)
@@ -1128,6 +1141,7 @@ async def cmd_resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE)
         set_working_dir(conv_key, resolved)
         set_home_dir(conv_key, resolved)
         set_current_session(conv_key, session_id, "external session")
+        logger.info("Resumed external session %s... in new topic %s for %s", session_id[:8], new_thread_id, resolved)
 
         await context.bot.send_message(
             chat_id=chat.id,
@@ -1148,6 +1162,7 @@ async def cmd_resume_session(update: Update, context: ContextTypes.DEFAULT_TYPE)
         # Private chat, sub-topic, or non-forum group: just register the session
         conv_key = get_conv_key(update)
         set_current_session(conv_key, session_id, "external session")
+        logger.info("Attached external session %s... to conv %s", session_id[:8], conv_key)
         await update.message.reply_text(
             f"Session `{session_id[:16]}...` set as current.\n"
             "Your next message will resume it.",
