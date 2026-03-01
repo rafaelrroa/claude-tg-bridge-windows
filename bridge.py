@@ -275,6 +275,51 @@ MEDIA_GROUP_WAIT = 1.5  # seconds to wait for more photos in an album
 
 ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
+# Matches a full GFM table: header row | separator row | one or more data rows
+_TABLE_RE = re.compile(
+    r"^(\|[^\n]+\|[ \t]*\n)(\|[ \t:|\\-]+\|[ \t]*\n)((?:\|[^\n]+\|[ \t]*\n?)+)",
+    re.MULTILINE,
+)
+
+
+def _table_to_code_block(m: re.Match) -> str:
+    """Render a GFM table as a monospace ASCII code block."""
+    def parse_row(line: str) -> list[str]:
+        return [c.strip() for c in line.strip().strip("|").split("|")]
+
+    header = parse_row(m.group(1))
+    data_rows = [parse_row(l) for l in m.group(3).strip().splitlines() if l.strip()]
+    n = len(header)
+    widths = [len(h) for h in header]
+    for row in data_rows:
+        for i, cell in enumerate(row[:n]):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt(cells: list[str]) -> str:
+        return "  ".join(
+            (cells[i] if i < len(cells) else "").ljust(widths[i]) for i in range(n)
+        )
+
+    lines = [fmt(header), "  ".join("─" * w for w in widths)]
+    lines += [fmt(row) for row in data_rows]
+    return "```\n" + "\n".join(lines) + "\n```\n"
+
+
+def preprocess_md(text: str) -> str:
+    """Adapt GFM Markdown to Telegram's legacy Markdown dialect.
+
+    - **bold** → *bold*  (GFM double-asterisk → Telegram single-asterisk)
+    - ## Header → *Header*  (headers become bold lines)
+    - Tables → monospace ASCII code block
+    """
+    # **bold** → *bold*  (must run before header conversion)
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    # ## Heading → *Heading*
+    text = re.sub(r"^#{1,6} (.+)$", r"*\1*", text, flags=re.MULTILINE)
+    # GFM tables → ASCII code block
+    text = _TABLE_RE.sub(_table_to_code_block, text)
+    return text
+
 
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
@@ -303,6 +348,8 @@ def truncate_message(text: str, max_len: int = MAX_MSG_LEN) -> list[str]:
 async def send_safe(
     update: Update, text: str, parse_mode: str | None = "Markdown"
 ) -> None:
+    if parse_mode == "Markdown":
+        text = preprocess_md(text)
     chunks = truncate_message(text)
     for chunk in chunks:
         try:
