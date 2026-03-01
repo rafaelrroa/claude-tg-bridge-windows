@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Claude Code Telegram Bridge v16.
+"""Claude Code Telegram Bridge v17.
 
 Single-file Telegram bot that proxies messages to Claude CLI subprocesses.
 Streaming responses, session management, image support, per-user working dirs.
 
-v16: Forum topics support — each topic gets its own session, model, and working
-directory.  Private chats continue to work as before.
+v17: Context-aware command permissions — hub-and-spoke forum model with
+foundational management chat and per-topic Claude workspaces.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
@@ -66,6 +67,11 @@ READLINE_TIMEOUT = 0.3  # seconds — how often to check cancellation
 PROCESS_TIMEOUT = 3600  # 1 hour max per Claude invocation
 IMAGE_DIR = Path(tempfile.gettempdir()) / "tg_images"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+# Clean up stale images from previous runs (older than 1 hour)
+for _old in IMAGE_DIR.iterdir():
+    if _old.is_file() and (time.time() - _old.stat().st_mtime) > 3600:
+        with contextlib.suppress(OSError):
+            _old.unlink()
 
 ALLOWED_TOOLS = [
     "Bash", "Read", "Edit", "Write", "Glob", "Grep",
@@ -101,186 +107,214 @@ logger = logging.getLogger(__name__)
 
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id TEXT NOT NULL,
-            session_id TEXT NOT NULL,
-            description TEXT,
-            model TEXT DEFAULT 'sonnet',
-            created_at TEXT DEFAULT (datetime('now')),
-            last_used TEXT DEFAULT (datetime('now')),
-            is_current INTEGER DEFAULT 0
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS user_prefs (
-            user_id TEXT PRIMARY KEY,
-            model TEXT DEFAULT 'sonnet',
-            working_dir TEXT,
-            home_dir TEXT
-        )
-    """)
-    # Migration: add home_dir column to existing databases
     try:
-        c.execute("ALTER TABLE user_prefs ADD COLUMN home_dir TEXT")
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                description TEXT,
+                model TEXT DEFAULT 'sonnet',
+                created_at TEXT DEFAULT (datetime('now')),
+                last_used TEXT DEFAULT (datetime('now')),
+                is_current INTEGER DEFAULT 0
+            )
+        """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS user_prefs (
+                user_id TEXT PRIMARY KEY,
+                model TEXT DEFAULT 'sonnet',
+                working_dir TEXT,
+                home_dir TEXT
+            )
+        """)
+        # Migration: add home_dir column to existing databases
+        try:
+            c.execute("ALTER TABLE user_prefs ADD COLUMN home_dir TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        c.execute(
+            "CREATE INDEX IF NOT EXISTS idx_user_sessions "
+            "ON sessions(user_id, last_used DESC)"
+        )
         conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
-    c.execute(
-        "CREATE INDEX IF NOT EXISTS idx_user_sessions "
-        "ON sessions(user_id, last_used DESC)"
-    )
-    conn.commit()
-    conn.close()
+    finally:
+        conn.close()
 
 
 def get_user_model(uid: str) -> str:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute("SELECT model FROM user_prefs WHERE user_id = ?", (uid,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else "sonnet"
+    try:
+        c = conn.cursor()
+        c.execute("SELECT model FROM user_prefs WHERE user_id = ?", (uid,))
+        row = c.fetchone()
+        return row[0] if row else "sonnet"
+    finally:
+        conn.close()
 
 
 def set_user_model(uid: str, model: str) -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO user_prefs (user_id, model) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET model = ?",
-        (uid, model, model),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO user_prefs (user_id, model) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET model = ?",
+            (uid, model, model),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_working_dir(uid: str) -> str:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute("SELECT working_dir FROM user_prefs WHERE user_id = ?", (uid,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else DEFAULT_WORKING_DIR
+    try:
+        c = conn.cursor()
+        c.execute("SELECT working_dir FROM user_prefs WHERE user_id = ?", (uid,))
+        row = c.fetchone()
+        return row[0] if row and row[0] else DEFAULT_WORKING_DIR
+    finally:
+        conn.close()
 
 
 def set_working_dir(uid: str, path: str) -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO user_prefs (user_id, working_dir) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET working_dir = ?",
-        (uid, path, path),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO user_prefs (user_id, working_dir) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET working_dir = ?",
+            (uid, path, path),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_home_dir(uid: str) -> str | None:
     """Return the fixed navigation floor for this conversation, or None if unset."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute("SELECT home_dir FROM user_prefs WHERE user_id = ?", (uid,))
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row and row[0] else None
+    try:
+        c = conn.cursor()
+        c.execute("SELECT home_dir FROM user_prefs WHERE user_id = ?", (uid,))
+        row = c.fetchone()
+        return row[0] if row and row[0] else None
+    finally:
+        conn.close()
 
 
 def set_home_dir(uid: str, path: str) -> None:
     """Permanently fix the navigation floor for this conversation."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute(
-        "INSERT INTO user_prefs (user_id, home_dir) VALUES (?, ?) "
-        "ON CONFLICT(user_id) DO UPDATE SET home_dir = ?",
-        (uid, path, path),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute(
+            "INSERT INTO user_prefs (user_id, home_dir) VALUES (?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET home_dir = ?",
+            (uid, path, path),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_current_session(uid: str) -> str | None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute(
-        "SELECT session_id FROM sessions WHERE user_id = ? AND is_current = 1",
-        (uid,),
-    )
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT session_id FROM sessions WHERE user_id = ? AND is_current = 1",
+            (uid,),
+        )
+        row = c.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 
 def get_latest_session(uid: str) -> str | None:
     """Return the most recently used session for this conv_key (ignoring is_current)."""
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute(
-        "SELECT session_id FROM sessions WHERE user_id = ? ORDER BY last_used DESC LIMIT 1",
-        (uid,),
-    )
-    row = c.fetchone()
-    conn.close()
-    return row[0] if row else None
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT session_id FROM sessions WHERE user_id = ? ORDER BY last_used DESC LIMIT 1",
+            (uid,),
+        )
+        row = c.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
 
 
 def set_current_session(uid: str, session_id: str, description: str = "") -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute("UPDATE sessions SET is_current = 0 WHERE user_id = ?", (uid,))
-    c.execute(
-        "SELECT id FROM sessions WHERE user_id = ? AND session_id = ?",
-        (uid, session_id),
-    )
-    now = datetime.now(tz=timezone.utc).isoformat()
-    if c.fetchone():
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE sessions SET is_current = 0 WHERE user_id = ?", (uid,))
         c.execute(
-            "UPDATE sessions SET is_current = 1, last_used = ?, "
-            "description = COALESCE(NULLIF(?, ''), description) "
-            "WHERE user_id = ? AND session_id = ?",
-            (now, description, uid, session_id),
+            "SELECT id FROM sessions WHERE user_id = ? AND session_id = ?",
+            (uid, session_id),
         )
-    else:
-        c.execute(
-            "INSERT INTO sessions "
-            "(user_id, session_id, description, is_current, model, created_at, last_used) "
-            "VALUES (?, ?, ?, 1, ?, ?, ?)",
-            (uid, session_id, description, get_user_model(uid), now, now),
-        )
-    conn.commit()
-    conn.close()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        if c.fetchone():
+            c.execute(
+                "UPDATE sessions SET is_current = 1, last_used = ?, "
+                "description = COALESCE(NULLIF(?, ''), description) "
+                "WHERE user_id = ? AND session_id = ?",
+                (now, description, uid, session_id),
+            )
+        else:
+            # Inline model lookup to avoid opening a second connection
+            c.execute("SELECT model FROM user_prefs WHERE user_id = ?", (uid,))
+            model_row = c.fetchone()
+            model = model_row[0] if model_row else "sonnet"
+            c.execute(
+                "INSERT INTO sessions "
+                "(user_id, session_id, description, is_current, model, created_at, last_used) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?)",
+                (uid, session_id, description, model, now, now),
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def clear_current_session(uid: str) -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute("UPDATE sessions SET is_current = 0 WHERE user_id = ?", (uid,))
-    conn.commit()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute("UPDATE sessions SET is_current = 0 WHERE user_id = ?", (uid,))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_session_history(uid: str, limit: int = 15) -> list[dict[str, Any]]:
     conn = sqlite3.connect(DB_PATH, timeout=10)
-    c = conn.cursor()
-    c.execute(
-        "SELECT session_id, description, model, last_used, is_current "
-        "FROM sessions WHERE user_id = ? ORDER BY last_used DESC LIMIT ?",
-        (uid, limit),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return [
-        {
-            "id": r[0],
-            "desc": r[1] or "",
-            "model": r[2],
-            "last_used": r[3],
-            "current": r[4],
-        }
-        for r in rows
-    ]
+    try:
+        c = conn.cursor()
+        c.execute(
+            "SELECT session_id, description, model, last_used, is_current "
+            "FROM sessions WHERE user_id = ? ORDER BY last_used DESC LIMIT ?",
+            (uid, limit),
+        )
+        rows = c.fetchall()
+        return [
+            {
+                "id": r[0],
+                "desc": r[1] or "",
+                "model": r[2],
+                "last_used": r[3],
+                "current": r[4],
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
 
 
 init_db()
@@ -295,7 +329,7 @@ init_db()
 @dataclass
 class UserState:
     process: asyncio.subprocess.Process | None = None
-    queue: list[str] = field(default_factory=list)
+    queue: collections.deque[str] = field(default_factory=collections.deque)
     cancelled: bool = False
     busy: bool = False
     force_new: bool = False
@@ -781,7 +815,7 @@ async def run_claude_streaming(
 
     except Exception as e:
         logger.error("Streaming error: %s", e)
-        await update.message.reply_text(f"Error: {str(e)[:200]}")
+        await update.message.reply_text("An error occurred while processing. Please try again.")
 
     finally:
         state.process = None
@@ -834,7 +868,7 @@ async def run_and_drain(
         if state.cancelled or not state.queue:
             prompt = None
         else:
-            prompt = state.queue.pop(0)
+            prompt = state.queue.popleft()
 
     # Release the busy flag — MUST be last
     state.busy = False
@@ -1347,6 +1381,7 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     url = context.args[0]
 
+    # Intentionally GitHub-only for now; extend pattern for GitLab/Bitbucket if needed
     if not re.match(r"https?://github\.com/[\w.\-]+/[\w.\-]+(\.git)?/?$", url):
         await update.message.reply_text(
             "Please provide a valid GitHub URL.\n"
@@ -1439,8 +1474,6 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Cloned `{repo_name}`\n\U0001f4c1 `{resolved}`\n\nNew session ready.",
             parse_mode="Markdown",
         )
-
-
 
 
 # ── Message + Photo Handlers ─────────────────────────────────────────
@@ -1562,9 +1595,12 @@ async def _flush_media_group(group_id: str) -> None:
     group = media_group_buffer.pop(group_id, None)
     if not group:
         return
-    await _submit_photos(
-        group["conv_key"], group["images"], group["caption"], group["update"]
-    )
+    try:
+        await _submit_photos(
+            group["conv_key"], group["images"], group["caption"], group["update"]
+        )
+    except Exception:
+        logger.exception("Failed to submit media group %s", group_id)
 
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1684,9 +1720,11 @@ def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
     """Kill a process and all its children, cross-platform."""
     pid = process.pid
     if IS_WINDOWS:
-        # taskkill /T kills the entire process tree
         logger.info("Killing process tree %d (taskkill)", pid)
-        os.system(f"taskkill /F /T /PID {pid} >NUL 2>&1")
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
     else:
         pgid = os.getpgid(pid)
         logger.info("Killing process group %d", pgid)
@@ -1713,6 +1751,9 @@ async def shutdown_cleanup(app: Application) -> None:
 def main() -> None:
     if not BOT_TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN not set")
+        raise SystemExit(1)
+    if not ALLOWED_USERS:
+        logger.error("ALLOWED_USERS not set — add at least one Telegram user ID")
         raise SystemExit(1)
 
     app = (

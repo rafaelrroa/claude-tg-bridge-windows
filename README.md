@@ -39,7 +39,7 @@ cp .env.example .env
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | **Yes** | — | Bot token from @BotFather |
-| `ALLOWED_USERS` | No | `—` | Comma-separated Telegram user IDs allowed to use the bot |
+| `ALLOWED_USERS` | **Yes** | — | Comma-separated Telegram user IDs allowed to use the bot |
 | `ALLOWED_CHATS` | No | _(empty — blocks all groups)_ | Comma-separated group/supergroup IDs to allow |
 | `WORKING_DIR` | No | `~` (home dir) | Bot root directory — the top of the `claude-bot:/` filesystem |
 | `BRIDGE_DB` | No | `sessions.db` | SQLite database path |
