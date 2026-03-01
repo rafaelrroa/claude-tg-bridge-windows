@@ -783,31 +783,11 @@ async def run_and_drain(
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Telegram sends /start when the user first opens the bot — show the command list."""
     if not is_authorized(update.effective_user.id):
         await update.message.reply_text("Unauthorized")
         return
-    if not is_chat_allowed(update.effective_chat):
-        return
-    conv_key = get_conv_key(update)
-    model = get_user_model(conv_key)
-    session_id = get_current_session(conv_key)
-    history = get_session_history(conv_key)
-    state = user_state.get(conv_key)
-    is_running = state.busy if state else False
-    floor = get_floor(conv_key, is_foundational_chat(update))
-    wd = format_bot_path(get_working_dir(conv_key), floor)
-
-    await update.message.reply_text(
-        f"*Claude Bridge v{VERSION}*\n\n"
-        f"Model: *{model}*\n"
-        f"Session: `{session_id[:8] if session_id else 'None'}...`\n"
-        f"Status: {'RUNNING' if is_running else 'idle'}\n"
-        f"Dir: `{wd}`\n"
-        f"Sessions: {len(history)}\n\n"
-        "/help — command reference\n"
-        "/readme — usage guide",
-        parse_mode="Markdown",
-    )
+    await cmd_help(update, context)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -827,12 +807,11 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/sonnet — Switch to Sonnet\n"
         "/opus — Switch to Opus\n\n"
         "*Filesystem*\n"
-        "/cd [path] — Navigate to a directory\n"
-        "/ls [path] — Same as /cd\n"
+        "/cd [path] — Browse filesystem (tap folders to navigate)\n"
         "/pwd — Show current directory\n"
         "/clone <url> — Clone a GitHub repo and open a session\n\n"
         "*Help*\n"
-        "/start — Status overview\n"
+        "/status — Model, session, uptime, working dir\n"
         "/help — This message\n"
         "/readme — Usage guide",
         parse_mode="Markdown",
@@ -858,7 +837,7 @@ async def cmd_readme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         "• /new <folder> — opens an existing folder as a new topic\n"
         "Each topic has its own session, model, and working directory.\n\n"
         "*Filesystem navigation*\n"
-        "/ls or /cd opens a folder browser with inline buttons.\n"
+        "/cd opens a folder browser with inline buttons.\n"
         "Tap a folder to navigate into it. The ⬆ .. button goes up one level.\n"
         "It disappears at your root (claude-bot:/) — you can't go above it.\n"
         "Pagination appears when a folder has more than 8 subfolders.\n\n"
@@ -904,10 +883,19 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg)
 
 
+_FOUNDATIONAL_CLAUDE_BLOCKED = (
+    "This is the management chat — Claude is not active here.\n"
+    "Use /new <folder> or /clone <url> to open a project in a topic."
+)
+
+
 async def cmd_haiku(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
     if not is_chat_allowed(update.effective_chat):
+        return
+    if is_foundational_chat(update):
+        await update.message.reply_text("Model switching works per-topic. Use this inside a topic.")
         return
     set_user_model(get_conv_key(update), "haiku")
     await update.message.reply_text("Switched to *Haiku*", parse_mode="Markdown")
@@ -918,6 +906,9 @@ async def cmd_sonnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    if is_foundational_chat(update):
+        await update.message.reply_text("Model switching works per-topic. Use this inside a topic.")
+        return
     set_user_model(get_conv_key(update), "sonnet")
     await update.message.reply_text("Switched to *Sonnet*", parse_mode="Markdown")
 
@@ -926,6 +917,9 @@ async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
     if not is_chat_allowed(update.effective_chat):
+        return
+    if is_foundational_chat(update):
+        await update.message.reply_text("Model switching works per-topic. Use this inside a topic.")
         return
     set_user_model(get_conv_key(update), "opus")
     await update.message.reply_text("Switched to *Opus*", parse_mode="Markdown")
@@ -1053,7 +1047,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     state = user_state.get(conv_key)
     is_running = state.busy if state else False
     queued = len(state.queue) if state else 0
-    wd = get_working_dir(conv_key)
+    floor = get_floor(conv_key, is_foundational_chat(update))
+    wd = format_bot_path(get_working_dir(conv_key), floor)
     uptime = int(time.monotonic() - start_time)
     uptime_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
 
@@ -1063,7 +1058,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Session: `{session_id[:16] if session_id else 'None'}...`\n"
         f"Running: {'Yes' if is_running else 'No'}\n"
         f"Queued: {queued}\n"
-        f"Working dir: `{wd}`\n"
+        f"Dir: `{wd}`\n"
         f"Uptime: {uptime_str}\n"
         f"Version: {VERSION}",
         parse_mode="Markdown",
@@ -1240,7 +1235,6 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-cmd_ls = cmd_nav  # /ls is an alias for /cd — both open the interactive browser
 
 
 # ── Message + Photo Handlers ─────────────────────────────────────────
@@ -1251,6 +1245,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("Unauthorized")
         return
     if not is_chat_allowed(update.effective_chat):
+        return
+
+    if is_foundational_chat(update):
+        await update.message.reply_text(_FOUNDATIONAL_CLAUDE_BLOCKED)
         return
 
     prompt = update.message.text
@@ -1368,6 +1366,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    if is_foundational_chat(update):
+        return  # silently ignore photos in the management chat
 
     conv_key = get_conv_key(update)
     image_path = await _download_photo(update, context)
@@ -1527,7 +1527,6 @@ def main() -> None:
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cd", cmd_nav))
-    app.add_handler(CommandHandler("ls", cmd_nav))
     app.add_handler(CommandHandler("pwd", cmd_pwd))
     app.add_handler(CommandHandler("clone", cmd_clone))
     app.add_handler(CallbackQueryHandler(button_callback))
