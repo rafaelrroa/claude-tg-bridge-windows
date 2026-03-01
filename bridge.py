@@ -44,7 +44,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "16.1.0"
+VERSION = "16.2.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -71,6 +71,11 @@ ALLOWED_TOOLS = [
     "Bash", "Read", "Edit", "Write", "Glob", "Grep",
     "WebFetch", "WebSearch", "Task(Explore)", "Task(Plan)",
 ]
+
+_FOUNDATIONAL_CLAUDE_BLOCKED = (
+    "This is the management chat — Claude is not active here.\n"
+    "Use /new <folder> or /clone <url> to open a project in a topic."
+)
 
 # ── Logging ──────────────────────────────────────────────────────────
 
@@ -144,8 +149,9 @@ def set_user_model(uid: str, model: str) -> None:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     c = conn.cursor()
     c.execute(
-        "INSERT OR REPLACE INTO user_prefs (user_id, model) VALUES (?, ?)",
-        (uid, model),
+        "INSERT INTO user_prefs (user_id, model) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET model = ?",
+        (uid, model, model),
     )
     conn.commit()
     conn.close()
@@ -398,9 +404,20 @@ async def send_safe(
 
 def is_authorized(user_id: int) -> bool:
     if user_id not in ALLOWED_USERS:
-        logger.warning("Unauthorized user_id=%d (allowed: %s)", user_id, ALLOWED_USERS)
+        logger.warning("Unauthorized user_id=%d", user_id)
         return False
     return True
+
+
+def _log_cmd(update: Update, cmd: str) -> None:
+    """Log an incoming command with user and conversation context."""
+    uid = update.effective_user.id if update.effective_user else "?"
+    chat = update.effective_chat
+    chat_info = f"chat={chat.id}" if chat else ""
+    msg = update.effective_message
+    thread_id = getattr(msg, "message_thread_id", None) if msg else None
+    thread_info = f" thread={thread_id}" if thread_id else ""
+    logger.info("/%s from user=%s %s%s", cmd, uid, chat_info, thread_info)
 
 
 def is_chat_allowed(chat) -> bool:
@@ -795,6 +812,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    _log_cmd(update, "help")
     await update.message.reply_text(
         "*Claude Bridge — Commands*\n\n"
         "*Sessions*\n"
@@ -811,7 +829,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/pwd — Show current directory\n"
         "/clone <url> — Clone a GitHub repo and open a session\n\n"
         "*Help*\n"
-        "/status — Model, session, uptime, working dir\n"
         "/help — This message\n"
         "/readme — Usage guide",
         parse_mode="Markdown",
@@ -823,6 +840,7 @@ async def cmd_readme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    _log_cmd(update, "readme")
     await update.message.reply_text(
         "*Quick start*\n"
         "Just send a message — Claude responds. No commands needed.\n\n"
@@ -854,8 +872,7 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_chat_allowed(update.effective_chat):
         return
     conv_key = get_conv_key(update)
-
-    logger.info("/stop received from %s", conv_key)
+    _log_cmd(update, "stop")
     state = user_state.get(conv_key)
 
     if not state or not state.busy:
@@ -883,12 +900,6 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(msg)
 
 
-_FOUNDATIONAL_CLAUDE_BLOCKED = (
-    "This is the management chat — Claude is not active here.\n"
-    "Use /new <folder> or /clone <url> to open a project in a topic."
-)
-
-
 async def cmd_haiku(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
@@ -897,6 +908,7 @@ async def cmd_haiku(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_foundational_chat(update):
         await update.message.reply_text("Model switching works per-topic. Use this inside a topic.")
         return
+    _log_cmd(update, "haiku")
     set_user_model(get_conv_key(update), "haiku")
     await update.message.reply_text("Switched to *Haiku*", parse_mode="Markdown")
 
@@ -909,6 +921,7 @@ async def cmd_sonnet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if is_foundational_chat(update):
         await update.message.reply_text("Model switching works per-topic. Use this inside a topic.")
         return
+    _log_cmd(update, "sonnet")
     set_user_model(get_conv_key(update), "sonnet")
     await update.message.reply_text("Switched to *Sonnet*", parse_mode="Markdown")
 
@@ -921,6 +934,7 @@ async def cmd_opus(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if is_foundational_chat(update):
         await update.message.reply_text("Model switching works per-topic. Use this inside a topic.")
         return
+    _log_cmd(update, "opus")
     set_user_model(get_conv_key(update), "opus")
     await update.message.reply_text("Switched to *Opus*", parse_mode="Markdown")
 
@@ -930,6 +944,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    _log_cmd(update, "new")
 
     chat = update.effective_chat
 
@@ -1014,6 +1029,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    _log_cmd(update, "history")
 
     history = get_session_history(get_conv_key(update), 15)
     if not history:
@@ -1041,6 +1057,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    _log_cmd(update, "status")
     conv_key = get_conv_key(update)
     model = get_user_model(conv_key)
     session_id = get_current_session(conv_key)
@@ -1071,6 +1088,7 @@ async def cmd_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    _log_cmd(update, "cd")
     conv_key = get_conv_key(update)
     foundational = is_foundational_chat(update)
     floor = get_floor(conv_key, foundational)
@@ -1102,6 +1120,7 @@ async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    _log_cmd(update, "pwd")
     conv_key = get_conv_key(update)
     foundational = is_foundational_chat(update)
     floor = get_floor(conv_key, foundational)
@@ -1130,6 +1149,8 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Use /clone from the main forum chat or a private chat, not from inside a topic."
         )
         return
+
+    _log_cmd(update, "clone")
 
     if not context.args:
         await update.message.reply_text(
@@ -1261,6 +1282,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     conv_key = get_conv_key(update)
+    logger.info("Message from user=%s conv=%s len=%d", update.effective_user.id, conv_key, len(prompt))
     state = user_state.setdefault(conv_key, UserState())
 
     # ── CRITICAL SECTION ─────────────────────────────────────────
@@ -1388,7 +1410,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             group["caption"] = caption
         # Reset the timer
         group["timer"].cancel()
-        group["timer"] = asyncio.get_event_loop().call_later(
+        group["timer"] = asyncio.get_running_loop().call_later(
             MEDIA_GROUP_WAIT,
             lambda gid=group_id: asyncio.create_task(_flush_media_group(gid)),
         )
@@ -1399,7 +1421,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "images": [image_path],
             "caption": caption,
             "update": update,
-            "timer": asyncio.get_event_loop().call_later(
+            "timer": asyncio.get_running_loop().call_later(
                 MEDIA_GROUP_WAIT,
                 lambda gid=group_id: asyncio.create_task(_flush_media_group(gid)),
             ),
