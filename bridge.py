@@ -818,7 +818,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "*Claude Bridge — Commands*\n\n"
         "*Sessions*\n"
-        "/new \\[folder\\] — New session; in forum creates a topic\n"
+        "/new [folder] — New session; in forum creates a topic\n"
         "/history — Browse and resume past sessions\n"
         "/stop — Cancel the running task\n"
         "/status — Model, session ID, uptime, working dir\n\n"
@@ -827,15 +827,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/sonnet — Switch to Sonnet\n"
         "/opus — Switch to Opus\n\n"
         "*Filesystem*\n"
-        "/cd \\[path\\] — Navigate to a directory\n"
-        "/ls \\[path\\] — Same as /cd\n"
+        "/cd [path] — Navigate to a directory\n"
+        "/ls [path] — Same as /cd\n"
         "/pwd — Show current directory\n"
         "/clone <url> — Clone a GitHub repo and open a session\n\n"
         "*Help*\n"
         "/start — Status overview\n"
         "/help — This message\n"
         "/readme — Usage guide",
-        parse_mode="MarkdownV2",
+        parse_mode="Markdown",
     )
 
 
@@ -846,27 +846,26 @@ async def cmd_readme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     await update.message.reply_text(
         "*Quick start*\n"
-        "Just send a message — Claude responds\\. No commands needed\\.\n\n"
+        "Just send a message — Claude responds. No commands needed.\n\n"
         "*Sessions*\n"
-        "The bot auto\\-resumes your last session\\. Use /new to start fresh, "
-        "/history to pick a previous one\\. /stop cancels and clears the queue\\.\n\n"
+        "The bot auto-resumes your last session. Use /new to start fresh, "
+        "/history to pick a previous one. /stop cancels and clears the queue.\n\n"
         "*Models*\n"
-        "/haiku is fastest, /opus most capable\\. Switch any time mid\\-conversation\\.\n\n"
+        "/haiku is fastest, /opus most capable. Switch any time mid-conversation.\n\n"
         "*Forum / Supergroup*\n"
         "Use the General topic as your hub:\n"
-        "• /clone <url> → clones repo, creates a topic, starts session there\n"
-        "• /new <folder> → opens an existing folder as a new topic\n"
-        "Each topic has its own session, model, and working directory\\.\n\n"
+        "• /clone <url> — clones repo, creates a topic, starts session there\n"
+        "• /new <folder> — opens an existing folder as a new topic\n"
+        "Each topic has its own session, model, and working directory.\n\n"
         "*Filesystem navigation*\n"
-        "/ls or /cd opens a folder browser with inline buttons\\.\n"
-        "Tap a folder to navigate into it\\. ⬆ \\.\\.\\. goes up one level\\.\n"
-        "The ⬆ button disappears at your root \\(claude\\-bot:/\\) — "
-        "you can't navigate above it\\.\n"
-        "Pagination buttons appear when there are more than 8 subfolders\\.\n\n"
+        "/ls or /cd opens a folder browser with inline buttons.\n"
+        "Tap a folder to navigate into it. The ⬆ .. button goes up one level.\n"
+        "It disappears at your root (claude-bot:/) — you can't go above it.\n"
+        "Pagination appears when a folder has more than 8 subfolders.\n\n"
         "*Sending images*\n"
-        "Send a photo \\(or album\\) — Claude reads and analyses it\\. "
-        "Add a caption to include a question\\.",
-        parse_mode="MarkdownV2",
+        "Send a photo (or album) — Claude reads and analyses it. "
+        "Add a caption to ask something about it.",
+        parse_mode="Markdown",
     )
 
 
