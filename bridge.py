@@ -718,6 +718,58 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
+
+    chat = update.effective_chat
+
+    # ── Forum mode: /new <folder> creates a topic and sets working dir ──
+    if getattr(chat, "is_forum", False):
+        if not context.args:
+            await update.message.reply_text(
+                "Usage: `/new <folder>`\nCreates a new session topic with that working directory.",
+                parse_mode="Markdown",
+            )
+            return
+
+        folder = " ".join(context.args)
+        topic_name = os.path.basename(folder.rstrip("/\\")) or folder
+        topic_name = topic_name[:128]  # Telegram topic name limit
+
+        # Resolve working dir: relative paths are anchored to ROOT_DIR
+        if os.path.isabs(folder):
+            resolved = os.path.normpath(folder)
+        else:
+            resolved = os.path.normpath(os.path.join(ROOT_DIR, folder))
+
+        try:
+            topic = await context.bot.create_forum_topic(
+                chat_id=chat.id, name=topic_name
+            )
+        except Exception as e:
+            logger.error("create_forum_topic failed: %s", e)
+            await update.message.reply_text(f"Could not create topic: {e}")
+            return
+
+        new_thread_id = topic.message_thread_id
+        conv_key = f"{chat.id}:{new_thread_id}"
+
+        if is_within_root(resolved) and os.path.isdir(resolved):
+            set_working_dir(conv_key, resolved)
+            wd_line = f"📁 `{resolved}`"
+        else:
+            wd_line = f"📁 `{DEFAULT_WORKING_DIR}` (folder not found, using default)"
+
+        state = user_state.setdefault(conv_key, UserState())
+        state.force_new = True
+
+        await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=new_thread_id,
+            text=f"*{topic_name}*\n{wd_line}\n\nNew Claude session ready.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # ── Normal (non-forum) mode: reset session in current chat ──────────
     conv_key = get_conv_key(update)
     clear_current_session(conv_key)
     state = user_state.setdefault(conv_key, UserState())
