@@ -44,7 +44,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "16.0.0"
+VERSION = "16.1.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -60,6 +60,7 @@ DEFAULT_WORKING_DIR = os.environ.get("WORKING_DIR", os.path.expanduser("~"))
 ROOT_DIR = Path(DEFAULT_WORKING_DIR).resolve()  # sandbox root — users cannot cd above this
 DB_PATH = Path(os.environ.get("BRIDGE_DB", "sessions.db"))
 MAX_MSG_LEN = 4000
+NAV_PAGE_SIZE = 8   # directory buttons per page in interactive nav view
 STREAM_INTERVAL = 3  # seconds between Telegram message flushes
 READLINE_TIMEOUT = 0.3  # seconds — how often to check cancellation
 PROCESS_TIMEOUT = 3600  # 1 hour max per Claude invocation
@@ -112,9 +113,16 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS user_prefs (
             user_id TEXT PRIMARY KEY,
             model TEXT DEFAULT 'sonnet',
-            working_dir TEXT
+            working_dir TEXT,
+            home_dir TEXT
         )
     """)
+    # Migration: add home_dir column to existing databases
+    try:
+        c.execute("ALTER TABLE user_prefs ADD COLUMN home_dir TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
     c.execute(
         "CREATE INDEX IF NOT EXISTS idx_user_sessions "
         "ON sessions(user_id, last_used DESC)"
@@ -158,6 +166,29 @@ def set_working_dir(uid: str, path: str) -> None:
     c.execute(
         "INSERT INTO user_prefs (user_id, working_dir) VALUES (?, ?) "
         "ON CONFLICT(user_id) DO UPDATE SET working_dir = ?",
+        (uid, path, path),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_home_dir(uid: str) -> str | None:
+    """Return the fixed navigation floor for this conversation, or None if unset."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute("SELECT home_dir FROM user_prefs WHERE user_id = ?", (uid,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row and row[0] else None
+
+
+def set_home_dir(uid: str, path: str) -> None:
+    """Permanently fix the navigation floor for this conversation."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO user_prefs (user_id, home_dir) VALUES (?, ?) "
+        "ON CONFLICT(user_id) DO UPDATE SET home_dir = ?",
         (uid, path, path),
     )
     conn.commit()
@@ -418,6 +449,158 @@ def get_conv_key_from_callback(query) -> str:
     return str(chat.id)
 
 
+# ── Floor / Sandbox Helpers ──────────────────────────────────────────
+
+
+def is_foundational_chat(update: Update) -> bool:
+    """True if the update comes from the foundational chat (not a private or topic chat).
+
+    Foundational = the main group/supergroup or the General topic of a forum.
+    These use ROOT_DIR as their navigation floor.
+    Private chats and forum sub-topics are non-foundational and use their home_dir.
+    """
+    chat = update.effective_chat
+    if chat.type == "private":
+        return False
+    msg = update.effective_message
+    thread_id = getattr(msg, "message_thread_id", None) if msg else None
+    if getattr(chat, "is_forum", False):
+        return thread_id is None or thread_id == 1
+    return True  # non-forum group/supergroup
+
+
+def is_foundational_chat_from_callback(query) -> bool:
+    """Same as is_foundational_chat but derived from a callback query."""
+    chat = query.message.chat
+    if chat.type == "private":
+        return False
+    thread_id = getattr(query.message, "message_thread_id", None)
+    if getattr(chat, "is_forum", False):
+        return thread_id is None or thread_id == 1
+    return True
+
+
+def get_floor(conv_key: str, foundational: bool) -> str:
+    """Return the absolute path of the navigation floor for this conversation.
+
+    Foundational chats use ROOT_DIR. Others use their registered home_dir,
+    falling back to ROOT_DIR if none has been set yet.
+    """
+    if foundational:
+        return str(ROOT_DIR)
+    home = get_home_dir(conv_key)
+    return home if home else str(ROOT_DIR)
+
+
+def is_within_floor(path: str, floor: str) -> bool:
+    """Return True if path is at or below floor."""
+    try:
+        Path(path).resolve().relative_to(Path(floor).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def format_bot_path(abs_path: str, floor: str) -> str:
+    """Display abs_path as 'claude-bot:/<relative-to-floor>'.
+
+    Examples (floor = ROOT_DIR/myproject):
+      ROOT_DIR/myproject        → claude-bot:/
+      ROOT_DIR/myproject/src   → claude-bot:/src
+    """
+    try:
+        rel = Path(abs_path).resolve().relative_to(Path(floor).resolve())
+        rel_str = rel.as_posix()
+        return "claude-bot:/" if rel_str == "." else f"claude-bot:/{rel_str}"
+    except ValueError:
+        return abs_path  # fallback: raw path (should not happen in normal use)
+
+
+# ── Interactive Directory Navigation ────────────────────────────────
+
+
+def _nav_relpath(abs_path: str) -> str:
+    """Return path relative to ROOT_DIR for use in callback_data ('.' = ROOT_DIR)."""
+    try:
+        rel = Path(abs_path).resolve().relative_to(ROOT_DIR)
+        s = rel.as_posix()
+        return s if s != "." else "."
+    except ValueError:
+        return ""
+
+
+def _nav_abs(relpath: str) -> str:
+    """Resolve a relpath from callback_data back to an absolute path."""
+    if relpath in (".", ""):
+        return str(ROOT_DIR)
+    return str((ROOT_DIR / relpath).resolve())
+
+
+def _build_nav(target: str, page: int, floor: str) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Return (plain-text listing, InlineKeyboardMarkup) for directory navigation.
+
+    Directories appear as tappable buttons (paginated NAV_PAGE_SIZE per page).
+    Files are listed as plain text below the path header.
+    Tapping a directory button navigates into it and updates the working dir.
+    The ⬆ .. parent button is hidden when already at the floor.
+    Path is displayed as claude-bot:/<relative-to-floor>.
+    """
+    try:
+        entries = sorted(os.listdir(target))
+    except PermissionError:
+        return "Permission denied", None
+    except FileNotFoundError:
+        return "Directory not found", None
+
+    dirs = [e for e in entries if os.path.isdir(os.path.join(target, e))]
+    files = [e for e in entries if os.path.isfile(os.path.join(target, e))]
+
+    total_pages = max(1, (len(dirs) + NAV_PAGE_SIZE - 1) // NAV_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+
+    # Plain-text body (no Markdown — paths often contain underscores)
+    summary = f"  {len(dirs)} folder{'s' if len(dirs) != 1 else ''}, {len(files)} file{'s' if len(files) != 1 else ''}"
+    file_lines = ["  \U0001f4c4 " + e for e in files] or ["  (no files)"]
+    display_path = format_bot_path(target, floor)
+    text = f"\U0001f4c1 {display_path}\n{summary}\n\n" + "\n".join(file_lines)
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+
+    # ── Parent button (hidden at floor) ───────────────────────────
+    parent = str(Path(target).parent.resolve())
+    if is_within_floor(parent, floor) and Path(parent).resolve() != Path(target).resolve():
+        rel = _nav_relpath(parent)
+        cb = f"ls:{rel}:0"
+        if rel and len(cb.encode()) <= 64:
+            keyboard.append([InlineKeyboardButton("\u2b06\ufe0f ..", callback_data=cb)])
+
+    # ── Directory buttons (current page) ──────────────────────────
+    for d in dirs[page * NAV_PAGE_SIZE:(page + 1) * NAV_PAGE_SIZE]:
+        abs_d = os.path.normpath(os.path.join(target, d))
+        rel = _nav_relpath(abs_d)
+        cb = f"ls:{rel}:0"
+        if rel and len(cb.encode()) <= 64:
+            keyboard.append([InlineKeyboardButton(f"\U0001f4c1 {d}", callback_data=cb)])
+        # silently skip directories whose path is too long for callback_data
+
+    # ── Pagination row ─────────────────────────────────────────────
+    if total_pages > 1:
+        rel_cur = _nav_relpath(target)
+        nav_row: list[InlineKeyboardButton] = []
+        if page > 0:
+            cb = f"ls:{rel_cur}:{page - 1}"
+            if len(cb.encode()) <= 64:
+                nav_row.append(InlineKeyboardButton("\u25c0\ufe0f Prev", callback_data=cb))
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            cb = f"ls:{rel_cur}:{page + 1}"
+            if len(cb.encode()) <= 64:
+                nav_row.append(InlineKeyboardButton("Next \u25b6\ufe0f", callback_data=cb))
+        keyboard.append(nav_row)
+
+    return text, InlineKeyboardMarkup(keyboard) if keyboard else None
+
+
 # ── Claude Subprocess + Streaming ────────────────────────────────────
 
 
@@ -526,11 +709,7 @@ async def run_claude_streaming(
                         if block.get("type") == "text" and block.get("text"):
                             buffer.append(block["text"])
                         elif block.get("type") == "tool_use":
-                            tool_name = block.get("name", "tool")
                             await flush_buffer()
-                            await update.message.reply_text(
-                                f"\U0001f527 Using: {tool_name}"
-                            )
             except json.JSONDecodeError:
                 if line_text and not line_text.startswith("{"):
                     buffer.append(line_text)
@@ -557,9 +736,6 @@ async def run_claude_streaming(
                 set_current_session(conv_key, new_session_id, prompt[:100])
             except Exception:
                 logger.warning("Failed to save session", exc_info=True)
-            await update.message.reply_text(
-                f"_[Session: {new_session_id[:12]}...]_", parse_mode="Markdown"
-            )
 
 
 async def run_and_drain(
@@ -584,14 +760,6 @@ async def run_and_drain(
                 auto_continue = True
         state.force_new = False
 
-        if session_id:
-            status_text = f"({session_id[:8]}...)"
-        elif auto_continue:
-            status_text = "(continue)"
-        else:
-            status_text = "(new)"
-        await update.message.reply_text(f"Claude {model} {status_text}...")
-
         try:
             await run_claude_streaming(
                 update, prompt, session_id, model, conv_key, state,
@@ -606,9 +774,6 @@ async def run_and_drain(
             prompt = None
         else:
             prompt = state.queue.pop(0)
-            await update.message.reply_text(
-                f"Processing queued: {prompt[:50]}..."
-            )
 
     # Release the busy flag — MUST be last
     state.busy = False
@@ -646,7 +811,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/status - Check status\n"
         "/cd <path> - Change working directory\n"
         "/pwd - Show working directory\n"
-        "/ls [path] - List files",
+        "/ls [path] - List files\n"
+        "/clone <url> - Clone a GitHub repo and start session",
         parse_mode="Markdown",
     )
 
@@ -754,6 +920,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         if is_within_root(resolved) and os.path.isdir(resolved):
             set_working_dir(conv_key, resolved)
+            set_home_dir(conv_key, resolved)
             wd_line = f"📁 `{resolved}`"
         else:
             wd_line = f"📁 `{DEFAULT_WORKING_DIR}` (folder not found, using default)"
@@ -783,6 +950,7 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             resolved = os.path.normpath(os.path.join(ROOT_DIR, folder))
         if is_within_root(resolved) and os.path.isdir(resolved):
             set_working_dir(conv_key, resolved)
+            set_home_dir(conv_key, resolved)
             await update.message.reply_text(
                 f"New conversation — 📁 `{resolved}`", parse_mode="Markdown"
             )
@@ -856,26 +1024,30 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_chat_allowed(update.effective_chat):
         return
     conv_key = get_conv_key(update)
+    foundational = is_foundational_chat(update)
+    floor = get_floor(conv_key, foundational)
     if not context.args:
+        # No argument: show current directory with nav buttons
         wd = get_working_dir(conv_key)
-        await update.message.reply_text(f"Current: `{wd}`\nUsage: /cd <path>", parse_mode="Markdown")
+        text, markup = _build_nav(wd, 0, floor)
+        await update.message.reply_text(text, reply_markup=markup)
         return
     path = " ".join(context.args)
     resolved = os.path.expanduser(path)
     if not os.path.isabs(resolved):
         resolved = os.path.join(get_working_dir(conv_key), resolved)
     resolved = os.path.normpath(resolved)
-    if not is_within_root(resolved):
+    if not is_within_floor(resolved, floor):
         await update.message.reply_text(
-            f"Access denied: path is outside the allowed root `{ROOT_DIR}`",
-            parse_mode="Markdown",
+            f"Access denied: cannot navigate above {format_bot_path(floor, floor)}",
         )
         return
     if not os.path.isdir(resolved):
-        await update.message.reply_text(f"Not a directory: `{resolved}`", parse_mode="Markdown")
+        await update.message.reply_text(f"Not a directory: {format_bot_path(resolved, floor)}")
         return
     set_working_dir(conv_key, resolved)
-    await update.message.reply_text(f"Working directory: `{resolved}`", parse_mode="Markdown")
+    text, markup = _build_nav(resolved, 0, floor)
+    await update.message.reply_text(text, reply_markup=markup)
 
 
 async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -887,34 +1059,155 @@ async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"`{wd}`", parse_mode="Markdown")
 
 
+async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clone a GitHub repo into ROOT_DIR, set it as working dir, and start a new session.
+
+    Only allowed from private chats or from a foundational (non-sub-topic) group chat.
+    In a forum, creates a new topic for the cloned repo.
+    """
+    if not is_authorized(update.effective_user.id):
+        return
+    if not is_chat_allowed(update.effective_chat):
+        return
+
+    chat = update.effective_chat
+    msg = update.effective_message
+    thread_id = getattr(msg, "message_thread_id", None)
+
+    # Block from forum sub-topics (General topic has thread_id=1 or None)
+    if getattr(chat, "is_forum", False) and thread_id and thread_id != 1:
+        await update.message.reply_text(
+            "Use /clone from the main forum chat or a private chat, not from inside a topic."
+        )
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: `/clone <github-url>`\n"
+            "Clones the repository into the bot root and starts a new session.",
+            parse_mode="Markdown",
+        )
+        return
+
+    url = context.args[0]
+
+    if not re.match(r"https?://github\.com/[\w.\-]+/[\w.\-]+(\.git)?/?$", url):
+        await update.message.reply_text(
+            "Please provide a valid GitHub URL.\n"
+            "Example: `https://github.com/user/repo`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Derive the repo folder name from the URL
+    repo_name = url.rstrip("/")
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+    repo_name = repo_name.split("/")[-1]
+
+    dest = ROOT_DIR / repo_name
+    if dest.exists():
+        await update.message.reply_text(
+            f"Directory `{repo_name}` already exists in root.\n"
+            f"Use `/cd {repo_name}` or `/new {repo_name}` instead.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text(f"Cloning `{url}`...", parse_mode="Markdown")
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "clone", url, str(dest),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(ROOT_DIR),
+        )
+        _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=120)
+    except asyncio.TimeoutError:
+        await update.message.reply_text("Clone timed out after 2 minutes.")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"Clone failed: {e}")
+        return
+
+    if proc.returncode != 0:
+        err = stderr_bytes.decode("utf-8", errors="replace").strip()[-500:]
+        await update.message.reply_text(
+            f"Clone failed:\n```\n{err}\n```", parse_mode="Markdown"
+        )
+        return
+
+    resolved = str(dest.resolve())
+
+    if getattr(chat, "is_forum", False):
+        # Forum: create a new topic for the cloned repo
+        topic_name = repo_name[:128]
+        try:
+            topic = await context.bot.create_forum_topic(chat_id=chat.id, name=topic_name)
+        except Exception as e:
+            logger.error("create_forum_topic failed: %s", e)
+            await update.message.reply_text(
+                f"Cloned to `{resolved}` but could not create topic: {e}",
+                parse_mode="Markdown",
+            )
+            return
+
+        new_thread_id = topic.message_thread_id
+        conv_key = f"{chat.id}:{new_thread_id}"
+        set_working_dir(conv_key, resolved)
+        set_home_dir(conv_key, resolved)
+        clear_current_session(conv_key)
+        state = user_state.setdefault(conv_key, UserState())
+        state.force_new = True
+
+        await context.bot.send_message(
+            chat_id=chat.id,
+            message_thread_id=new_thread_id,
+            text=f"*{repo_name}*\n\U0001f4c1 `{resolved}`\n\nNew Claude session ready.",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(
+            f"Cloned and created topic *{topic_name}*.", parse_mode="Markdown"
+        )
+    else:
+        # Private chat or regular group: set wd and new session in this conversation
+        conv_key = get_conv_key(update)
+        set_working_dir(conv_key, resolved)
+        set_home_dir(conv_key, resolved)
+        clear_current_session(conv_key)
+        state = user_state.setdefault(conv_key, UserState())
+        state.force_new = True
+
+        await update.message.reply_text(
+            f"Cloned `{repo_name}`\n\U0001f4c1 `{resolved}`\n\nNew session ready.",
+            parse_mode="Markdown",
+        )
+
+
 async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_authorized(update.effective_user.id):
         return
     if not is_chat_allowed(update.effective_chat):
         return
-    wd = get_working_dir(get_conv_key(update))
+    conv_key = get_conv_key(update)
+    foundational = is_foundational_chat(update)
+    floor = get_floor(conv_key, foundational)
+    wd = get_working_dir(conv_key)
     target = " ".join(context.args) if context.args else wd
     if not os.path.isabs(target):
         target = os.path.join(wd, target)
     target = os.path.normpath(target)
-    if not is_within_root(target):
+    if not is_within_floor(target, floor):
         await update.message.reply_text(
-            f"Access denied: path is outside the allowed root `{ROOT_DIR}`",
-            parse_mode="Markdown",
+            f"Access denied: cannot navigate above {format_bot_path(floor, floor)}",
         )
         return
     if not os.path.isdir(target):
-        await update.message.reply_text(f"Not a directory: `{target}`", parse_mode="Markdown")
+        await update.message.reply_text(f"Not a directory: {format_bot_path(target, floor)}")
         return
-    try:
-        entries = sorted(os.listdir(target))
-        dirs = [f"📁 {e}/" for e in entries if os.path.isdir(os.path.join(target, e))]
-        files = [f"📄 {e}" for e in entries if os.path.isfile(os.path.join(target, e))]
-        result = "\n".join(dirs + files) or "(empty)"
-        header = f"`{target}`\n\n"
-        await send_safe(update, header + result, parse_mode="Markdown")
-    except PermissionError:
-        await update.message.reply_text("Permission denied")
+    text, markup = _build_nav(target, 0, floor)
+    await update.message.reply_text(text, reply_markup=markup)
 
 
 # ── Message + Photo Handlers ─────────────────────────────────────────
@@ -1100,6 +1393,36 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"Resumed session:\n`{session_id}`", parse_mode="Markdown"
         )
 
+    elif query.data and query.data.startswith("ls:"):
+        # Interactive directory navigation: ls:<relpath>:<page>
+        conv_key = get_conv_key_from_callback(query)
+        foundational = is_foundational_chat_from_callback(query)
+        floor = get_floor(conv_key, foundational)
+        parts = query.data.split(":", 2)
+        if len(parts) != 3:
+            await query.answer("Invalid navigation data")
+            return
+        _, relpath, page_str = parts
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 0
+        abs_path = _nav_abs(relpath)
+        if not is_within_floor(abs_path, floor):
+            await query.answer("Access denied")
+            return
+        if not os.path.isdir(abs_path):
+            await query.answer("Directory not found")
+            return
+        set_working_dir(conv_key, abs_path)
+        text, markup = _build_nav(abs_path, page, floor)
+        await query.answer()
+        with contextlib.suppress(Exception):
+            await query.edit_message_text(text[:4096], reply_markup=markup)
+
+    elif query.data == "noop":
+        await query.answer()
+
 
 # ── Error Handler ────────────────────────────────────────────────────
 
@@ -1171,6 +1494,7 @@ def main() -> None:
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("pwd", cmd_pwd))
     app.add_handler(CommandHandler("ls", cmd_ls))
+    app.add_handler(CommandHandler("clone", cmd_clone))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(
