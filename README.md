@@ -4,13 +4,14 @@ A Telegram bot that bridges users to Claude AI via the [Claude CLI](https://docs
 
 ## Features
 
-- **Streaming responses** — replies appear as Claude generates text, with no intermediate noise
+- **Streaming responses** — only Claude's final output is sent; no intermediate noise
 - **Session management** — multiple named sessions per conversation, persisted in SQLite
 - **Image support** — send photos; albums are batched into a single Claude call
-- **Interactive filesystem navigation** — `/ls` and `/cd` show inline buttons to browse directories; each chat is sandboxed to its own floor, displayed as `claude-bot:/`
+- **Interactive filesystem navigation** — `/cd` shows inline buttons to browse directories; each chat is sandboxed to its own floor, displayed as `claude-bot:/`
 - **Forum topic support** — each Supergroup topic gets its own session, model, and working directory
+- **Foundational / management chat** — the main forum channel is management-only; Claude runs inside topics, not in the hub
 - **Repository cloning** — `/clone <url>` clones a GitHub repo and immediately opens a new topic/session in it
-- **Model switching** — switch between Haiku, Sonnet, and Opus mid-conversation
+- **Model switching** — switch between Haiku, Sonnet, and Opus per topic
 - **Access control** — allowlist by Telegram user ID and/or chat ID
 - **Windows + Linux** — runs natively on both; systemd unit included for Linux
 
@@ -84,39 +85,44 @@ Send any message to [@userinfobot](https://t.me/userinfobot) — it replies with
 
 | Command | Description |
 |---|---|
-| `/start` | Show welcome message and command reference |
-| `/stop` | Cancel the running Claude process |
-| `/new [folder]` | Start a new session; in forum mode creates a new topic with that working directory |
-| `/clone <url>` | Clone a GitHub repo into the bot root and open a new session/topic in it |
-| `/history` | List past sessions with inline buttons to resume any of them |
-| `/status` | Show uptime, current model, session ID, and working directory |
-| `/haiku` | Switch to Claude Haiku |
-| `/sonnet` | Switch to Claude Sonnet |
-| `/opus` | Switch to Claude Opus |
-| `/pwd` | Show current working directory as `claude-bot:/path` |
-| `/cd [path]` | Navigate to a directory; without argument shows interactive folder browser |
-| `/ls [path]` | List directory contents with interactive folder buttons |
+| `/help` | List all commands (also shown on `/start`) |
+| `/readme` | In-chat usage guide |
+| `/status` | Current model, session ID, running state, uptime, working dir |
+| `/new [folder]` | New session; in forum mode creates a topic with that working directory |
+| `/clone <url>` | Clone a GitHub repo and open a new session/topic in it |
+| `/history` | Browse past sessions with inline buttons to resume any of them |
+| `/stop` | Cancel the running Claude process and clear the queue |
+| `/haiku` | Switch to Claude Haiku (per topic) |
+| `/sonnet` | Switch to Claude Sonnet (per topic) |
+| `/opus` | Switch to Claude Opus (per topic) |
+| `/cd [path]` | Browse filesystem with interactive folder buttons |
+| `/pwd` | Show current directory as `claude-bot:/path` |
 
 ## Usage Guide
 
 ### Private chat
 
-Send any message — Claude responds with the result of its full reasoning, using the configured tools. No status messages appear; only Claude's final output is shown.
+Send any message — Claude responds with its full output. No status messages appear; only the final result is shown. All commands are available.
 
-### Forum / Supergroup Topics
+### Forum / Supergroup Topics — two-level structure
 
-The **General topic** (or the group itself if it has no topics) is the **foundational chat**:
-- Its filesystem root is `claude-bot:/` — the full `WORKING_DIR`
-- Use `/clone <url>` or `/new <folder>` here to spin up new topics
+The bot uses a **hub-and-spoke** model:
 
-Each created topic is isolated:
-- Working directory locked to the cloned/opened folder (`claude-bot:/` within that topic)
-- Separate Claude session and model
+**General topic (foundational chat) — management hub:**
+- Use `/clone <url>` or `/new <folder>` to spin up new project topics
+- Use `/cd` to browse the filesystem at `claude-bot:/` (full root)
+- Claude is **not active** here — plain messages are ignored
+- Model switching commands are disabled (models are per-topic)
+
+**Project topics — Claude workspaces:**
+- Each topic has its own Claude session, model, and working directory
+- The working directory is locked to the project folder (`claude-bot:/` within that topic)
 - Cannot navigate above its own root with `/cd` or the folder buttons
+- Full Claude functionality: chat, images, session history, model switching
 
 ### Interactive filesystem navigation
 
-`/ls` and `/cd` show an inline keyboard instead of plain text:
+`/cd` shows an inline keyboard instead of plain text:
 
 ```
 📁 claude-bot:/myproject
@@ -124,7 +130,6 @@ Each created topic is isolated:
 
   📄 main.py
   📄 README.md
-  ...
 
 [ ⬆️ .. ]
 [ 📁 src ]
@@ -138,7 +143,7 @@ Each created topic is isolated:
 
 ### Cloning a repository
 
-From the foundational chat or a private chat:
+From the General topic or a private chat:
 
 ```
 /clone https://github.com/user/myrepo
@@ -147,13 +152,13 @@ From the foundational chat or a private chat:
 - Clones into `WORKING_DIR/myrepo`
 - In forum mode: creates a new topic named `myrepo` and sends the first message there
 - In private/group mode: sets the working directory to the cloned repo
-- In both cases, a new Claude session starts in the repo directory
+- In both cases, a new Claude session starts locked to the repo directory
 
 ### Session management
 
 - Each conversation auto-resumes its last session; use `/new` to start fresh
 - `/history` shows up to 15 past sessions as tappable buttons — tap one to resume it
-- `/status` shows the active session ID
+- `/status` shows the active session ID, model, and runtime info
 
 ### Queueing
 
@@ -178,9 +183,9 @@ All logic lives in a single file (`bridge.py`). No build step, no test suite.
 
 **Concurrency:** Atomic busy flag on asyncio's single-threaded event loop — no `await` between checking and setting `busy`, preventing race conditions when messages arrive faster than Claude responds.
 
-**Streaming:** Reads Claude's `stream-json` stdout line-by-line, buffers text, and flushes to Telegram every 3 seconds or on tool-use events. Only the final accumulated text is sent to the user.
+**Streaming:** Reads Claude's `stream-json` stdout line-by-line, buffers text, and flushes to Telegram every 3 seconds or on tool-use events. Only the final accumulated text is delivered to the user.
 
-**Sandboxing:** Each chat has a navigation *floor* stored in SQLite. The foundational chat's floor is `WORKING_DIR`; topic/private chats are locked to the folder they were opened with. `/cd` and folder buttons cannot navigate above the floor.
+**Sandboxing:** Each chat has a navigation *floor* stored in SQLite (`home_dir` column). The foundational chat's floor is `WORKING_DIR` (`claude-bot:/`); topic and private chats are locked to the folder they were opened with. `/cd` and folder buttons cannot navigate above the floor.
 
 **Process isolation:** Subprocesses are spawned with `start_new_session=True` (Linux) or `CREATE_NEW_PROCESS_GROUP` (Windows). stderr goes to DEVNULL to avoid pipe buffer overflow. `process.wait()` has a 5-second timeout with kill fallback.
 
