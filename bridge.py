@@ -44,7 +44,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "16.4.0"
+VERSION = "16.5.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -380,6 +380,15 @@ def strip_ansi(text: str) -> str:
     return ANSI_RE.sub("", text)
 
 
+def _markdown_safe(text: str) -> bool:
+    """Return False if text has obviously unclosed Markdown entities.
+
+    An odd number of triple-backtick fences means a code block was split
+    across chunks and Telegram will reject the message.
+    """
+    return text.count("```") % 2 == 0
+
+
 def truncate_message(text: str, max_len: int = MAX_MSG_LEN) -> list[str]:
     if len(text) <= max_len:
         return [text]
@@ -388,7 +397,10 @@ def truncate_message(text: str, max_len: int = MAX_MSG_LEN) -> list[str]:
         if len(text) <= max_len:
             chunks.append(text)
             break
-        bp = text.rfind("\n", 0, max_len)
+        # Prefer paragraph boundary (\n\n) to avoid splitting inside Markdown entities
+        bp = text.rfind("\n\n", 0, max_len)
+        if bp <= 0:
+            bp = text.rfind("\n", 0, max_len)
         if bp <= 0:
             bp = text.rfind(" ", 0, max_len)
         if bp <= 0:
@@ -407,10 +419,12 @@ async def send_safe(
         text = preprocess_md(text)
     chunks = truncate_message(text)
     for chunk in chunks:
+        # Proactively downgrade to plain text if the chunk has unclosed entities
+        effective_mode = None if (parse_mode == "Markdown" and not _markdown_safe(chunk)) else parse_mode
         try:
-            await update.message.reply_text(chunk, parse_mode=parse_mode)
+            await update.message.reply_text(chunk, parse_mode=effective_mode)
         except Exception:
-            logger.warning("send_safe: Markdown send failed, retrying as plain text", exc_info=True)
+            logger.debug("send_safe: send failed (parse_mode=%s), retrying as plain", effective_mode, exc_info=True)
             clean = chunk.replace("_", "").replace("*", "").replace("`", "")
             try:
                 await update.message.reply_text(clean)
