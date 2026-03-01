@@ -44,7 +44,7 @@ from telegram.ext import (
 
 # ── Configuration ────────────────────────────────────────────────────
 
-VERSION = "16.5.0"
+VERSION = "17.0.0"
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USERS = {
     int(x)
@@ -74,7 +74,7 @@ ALLOWED_TOOLS = [
 
 _FOUNDATIONAL_CLAUDE_BLOCKED = (
     "This is the management chat — Claude is not active here.\n"
-    "Use /new <folder> or /clone <url> to open a project in a topic."
+    "Navigate with /cd, then /new (or /clone <url>) to open a project topic."
 )
 
 # ── Logging ──────────────────────────────────────────────────────────
@@ -529,6 +529,18 @@ def is_foundational_chat_from_callback(query) -> bool:
     return True
 
 
+def is_topic_chat(update: Update) -> bool:
+    """True if the update comes from a forum sub-topic (thread_id > 1).
+
+    Sub-topics are the per-project session chats created by /new, /clone, /resume.
+    They are distinct from both private chats and the foundational General topic.
+    """
+    chat = update.effective_chat
+    msg = update.effective_message
+    thread_id = getattr(msg, "message_thread_id", None) if msg else None
+    return bool(getattr(chat, "is_forum", False) and thread_id and thread_id > 1)
+
+
 def get_floor(conv_key: str, foundational: bool) -> str:
     """Return the absolute path of the navigation floor for this conversation.
 
@@ -844,26 +856,27 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    if is_topic_chat(update):
+        await update.message.reply_text("Use /help in the main chat.")
+        return
     _log_cmd(update, "help")
     await update.message.reply_text(
         "*Claude Bridge — Commands*\n\n"
-        "*Sessions*\n"
-        "/new [folder] — New session; in forum creates a topic\n"
-        "/history — Browse and resume past sessions\n"
+        "*Main chat / private* (project management)\n"
+        "/cd [path] — Navigate filesystem\n"
+        "/new [folder] — Open project folder as a new topic\n"
+        "/clone <url> — Clone a GitHub repo and open a topic\n"
         "/resume <id> — Attach an external CLI session\n"
-        "/stop — Cancel the running task\n"
-        "/status — Model, session ID, uptime, working dir\n\n"
-        "*Models*\n"
-        "/haiku — Switch to Haiku\n"
-        "/sonnet — Switch to Sonnet\n"
-        "/opus — Switch to Opus\n\n"
-        "*Filesystem*\n"
-        "/cd [path] — Browse filesystem (tap folders to navigate)\n"
+        "/status — Model, session ID, uptime, working dir\n"
         "/pwd — Show current directory\n"
-        "/clone <url> — Clone a GitHub repo and open a session\n\n"
-        "*Help*\n"
-        "/help — This message\n"
-        "/readme — Usage guide",
+        "/help — This message  /readme — Usage guide\n\n"
+        "*Inside a topic* (Claude session)\n"
+        "Send any message — Claude responds\n"
+        "/stop — Cancel task and close this topic\n"
+        "/history — Browse and resume past sessions\n"
+        "/resume <id> — Resume an external session here\n"
+        "/haiku /sonnet /opus — Switch model\n"
+        "/pwd — Show current directory",
         parse_mode="Markdown",
     )
 
@@ -872,6 +885,9 @@ async def cmd_readme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_authorized(update.effective_user.id):
         return
     if not is_chat_allowed(update.effective_chat):
+        return
+    if is_topic_chat(update):
+        await update.message.reply_text("Use /readme in the main chat.")
         return
     _log_cmd(update, "readme")
     await update.message.reply_text(
@@ -904,33 +920,52 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    if is_foundational_chat(update):
+        await update.message.reply_text("Nothing to stop here.")
+        return
     conv_key = get_conv_key(update)
     _log_cmd(update, "stop")
     state = user_state.get(conv_key)
 
-    if not state or not state.busy:
-        await update.message.reply_text("Nothing running")
-        return
+    if state and state.busy:
+        state.cancelled = True
+        cleared = len(state.queue)
+        state.queue.clear()
 
-    state.cancelled = True
-    cleared = len(state.queue)
-    state.queue.clear()
+        process = state.process
+        if process and process.returncode is None:
+            try:
+                _kill_process_tree(process)
+            except ProcessLookupError:
+                logger.info("Process already dead")
+            except Exception as e:
+                logger.error("Error stopping process: %s", e)
+                with contextlib.suppress(Exception):
+                    process.kill()
 
-    process = state.process
-    if process and process.returncode is None:
-        try:
-            _kill_process_tree(process)
-        except ProcessLookupError:
-            logger.info("Process already dead")
-        except Exception as e:
-            logger.error("Error stopping process: %s", e)
-            with contextlib.suppress(Exception):
-                process.kill()
+        reply = "Stopped."
+        if cleared:
+            reply += f" Cleared {cleared} queued message(s)."
+    else:
+        reply = "Nothing running."
 
-    msg = "Stopped."
-    if cleared:
-        msg += f" Cleared {cleared} queued message(s)."
-    await update.message.reply_text(msg)
+    # In a forum sub-topic, also close the topic (makes it read-only)
+    if is_topic_chat(update):
+        reply += "\nClosing topic…"
+
+    await update.message.reply_text(reply)
+
+    if is_topic_chat(update):
+        chat = update.effective_chat
+        thread_id = getattr(update.effective_message, "message_thread_id", None)
+        if thread_id:
+            try:
+                await context.bot.close_forum_topic(
+                    chat_id=chat.id, message_thread_id=thread_id
+                )
+                logger.info("Closed forum topic thread=%s chat=%s", thread_id, chat.id)
+            except Exception as e:
+                logger.warning("Could not close forum topic: %s", e)
 
 
 async def cmd_haiku(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -981,24 +1016,33 @@ async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     chat = update.effective_chat
 
-    # ── Forum mode: /new <folder> creates a topic and sets working dir ──
+    # ── Forum mode: creates a topic for the chosen working dir ──
     if getattr(chat, "is_forum", False):
-        if not context.args:
+        if is_topic_chat(update):
             await update.message.reply_text(
-                "Usage: `/new <folder>`\nCreates a new session topic with that working directory.",
-                parse_mode="Markdown",
+                "Use /new from the main chat to open a new project topic."
             )
             return
 
-        folder = " ".join(context.args)
-        topic_name = os.path.basename(folder.rstrip("/\\")) or folder
-        topic_name = topic_name[:128]  # Telegram topic name limit
-
-        # Resolve working dir: relative paths are anchored to ROOT_DIR
-        if os.path.isabs(folder):
-            resolved = os.path.normpath(folder)
+        if context.args:
+            # Explicit folder provided
+            folder = " ".join(context.args)
+            if os.path.isabs(folder):
+                resolved = os.path.normpath(folder)
+            else:
+                resolved = os.path.normpath(os.path.join(ROOT_DIR, folder))
         else:
-            resolved = os.path.normpath(os.path.join(ROOT_DIR, folder))
+            # No args: use the current navigation directory
+            hub_key = get_conv_key(update)
+            resolved = get_working_dir(hub_key)
+            if Path(resolved).resolve() == ROOT_DIR:
+                await update.message.reply_text(
+                    "Navigate to a project folder first with /cd, then run /new."
+                )
+                return
+
+        topic_name = os.path.basename(resolved.rstrip("/\\")) or resolved
+        topic_name = topic_name[:128]  # Telegram topic name limit
 
         try:
             topic = await context.bot.create_forum_topic(
@@ -1061,6 +1105,9 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not is_authorized(update.effective_user.id):
         return
     if not is_chat_allowed(update.effective_chat):
+        return
+    if is_foundational_chat(update):
+        await update.message.reply_text("Use /history inside a topic to browse its sessions.")
         return
     _log_cmd(update, "history")
 
@@ -1189,6 +1236,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not is_chat_allowed(update.effective_chat):
         return
+    if is_topic_chat(update):
+        await update.message.reply_text("Use /status in the main chat.")
+        return
     _log_cmd(update, "status")
     conv_key = get_conv_key(update)
     model = get_user_model(conv_key)
@@ -1215,10 +1265,13 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/cd and /ls — show interactive directory browser, optionally navigating first."""
+    """/cd — show interactive directory browser, optionally navigating first."""
     if not is_authorized(update.effective_user.id):
         return
     if not is_chat_allowed(update.effective_chat):
+        return
+    if is_topic_chat(update):
+        await update.message.reply_text("Navigation is only available in the main chat.")
         return
     _log_cmd(update, "cd")
     conv_key = get_conv_key(update)
