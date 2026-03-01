@@ -794,26 +794,79 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     history = get_session_history(conv_key)
     state = user_state.get(conv_key)
     is_running = state.busy if state else False
-    wd = get_working_dir(conv_key)
+    floor = get_floor(conv_key, is_foundational_chat(update))
+    wd = format_bot_path(get_working_dir(conv_key), floor)
 
     await update.message.reply_text(
         f"*Claude Bridge v{VERSION}*\n\n"
         f"Model: *{model}*\n"
         f"Session: `{session_id[:8] if session_id else 'None'}...`\n"
         f"Status: {'RUNNING' if is_running else 'idle'}\n"
-        f"Working dir: `{wd}`\n"
+        f"Dir: `{wd}`\n"
         f"Sessions: {len(history)}\n\n"
-        "*Commands:*\n"
-        "/stop - Cancel running task\n"
-        "/haiku /sonnet /opus - Switch model\n"
-        "/new - New conversation\n"
-        "/history - Browse sessions\n"
-        "/status - Check status\n"
-        "/cd <path> - Change working directory\n"
-        "/pwd - Show working directory\n"
-        "/ls [path] - List files\n"
-        "/clone <url> - Clone a GitHub repo and start session",
+        "/help — command reference\n"
+        "/readme — usage guide",
         parse_mode="Markdown",
+    )
+
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    if not is_chat_allowed(update.effective_chat):
+        return
+    await update.message.reply_text(
+        "*Claude Bridge — Commands*\n\n"
+        "*Sessions*\n"
+        "/new \\[folder\\] — New session; in forum creates a topic\n"
+        "/history — Browse and resume past sessions\n"
+        "/stop — Cancel the running task\n"
+        "/status — Model, session ID, uptime, working dir\n\n"
+        "*Models*\n"
+        "/haiku — Switch to Haiku\n"
+        "/sonnet — Switch to Sonnet\n"
+        "/opus — Switch to Opus\n\n"
+        "*Filesystem*\n"
+        "/cd \\[path\\] — Navigate to a directory\n"
+        "/ls \\[path\\] — Same as /cd\n"
+        "/pwd — Show current directory\n"
+        "/clone <url> — Clone a GitHub repo and open a session\n\n"
+        "*Help*\n"
+        "/start — Status overview\n"
+        "/help — This message\n"
+        "/readme — Usage guide",
+        parse_mode="MarkdownV2",
+    )
+
+
+async def cmd_readme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_authorized(update.effective_user.id):
+        return
+    if not is_chat_allowed(update.effective_chat):
+        return
+    await update.message.reply_text(
+        "*Quick start*\n"
+        "Just send a message — Claude responds\\. No commands needed\\.\n\n"
+        "*Sessions*\n"
+        "The bot auto\\-resumes your last session\\. Use /new to start fresh, "
+        "/history to pick a previous one\\. /stop cancels and clears the queue\\.\n\n"
+        "*Models*\n"
+        "/haiku is fastest, /opus most capable\\. Switch any time mid\\-conversation\\.\n\n"
+        "*Forum / Supergroup*\n"
+        "Use the General topic as your hub:\n"
+        "• /clone <url> → clones repo, creates a topic, starts session there\n"
+        "• /new <folder> → opens an existing folder as a new topic\n"
+        "Each topic has its own session, model, and working directory\\.\n\n"
+        "*Filesystem navigation*\n"
+        "/ls or /cd opens a folder browser with inline buttons\\.\n"
+        "Tap a folder to navigate into it\\. ⬆ \\.\\.\\. goes up one level\\.\n"
+        "The ⬆ button disappears at your root \\(claude\\-bot:/\\) — "
+        "you can't navigate above it\\.\n"
+        "Pagination buttons appear when there are more than 8 subfolders\\.\n\n"
+        "*Sending images*\n"
+        "Send a photo \\(or album\\) — Claude reads and analyses it\\. "
+        "Add a caption to include a question\\.",
+        parse_mode="MarkdownV2",
     )
 
 
@@ -1018,7 +1071,8 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/cd and /ls — show interactive directory browser, optionally navigating first."""
     if not is_authorized(update.effective_user.id):
         return
     if not is_chat_allowed(update.effective_chat):
@@ -1026,16 +1080,15 @@ async def cmd_cd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conv_key = get_conv_key(update)
     foundational = is_foundational_chat(update)
     floor = get_floor(conv_key, foundational)
+    wd = get_working_dir(conv_key)
     if not context.args:
-        # No argument: show current directory with nav buttons
-        wd = get_working_dir(conv_key)
         text, markup = _build_nav(wd, 0, floor)
         await update.message.reply_text(text, reply_markup=markup)
         return
     path = " ".join(context.args)
     resolved = os.path.expanduser(path)
     if not os.path.isabs(resolved):
-        resolved = os.path.join(get_working_dir(conv_key), resolved)
+        resolved = os.path.join(wd, resolved)
     resolved = os.path.normpath(resolved)
     if not is_within_floor(resolved, floor):
         await update.message.reply_text(
@@ -1055,8 +1108,11 @@ async def cmd_pwd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if not is_chat_allowed(update.effective_chat):
         return
-    wd = get_working_dir(get_conv_key(update))
-    await update.message.reply_text(f"`{wd}`", parse_mode="Markdown")
+    conv_key = get_conv_key(update)
+    foundational = is_foundational_chat(update)
+    floor = get_floor(conv_key, foundational)
+    wd = get_working_dir(conv_key)
+    await update.message.reply_text(format_bot_path(wd, floor))
 
 
 async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1185,29 +1241,7 @@ async def cmd_clone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-async def cmd_ls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_authorized(update.effective_user.id):
-        return
-    if not is_chat_allowed(update.effective_chat):
-        return
-    conv_key = get_conv_key(update)
-    foundational = is_foundational_chat(update)
-    floor = get_floor(conv_key, foundational)
-    wd = get_working_dir(conv_key)
-    target = " ".join(context.args) if context.args else wd
-    if not os.path.isabs(target):
-        target = os.path.join(wd, target)
-    target = os.path.normpath(target)
-    if not is_within_floor(target, floor):
-        await update.message.reply_text(
-            f"Access denied: cannot navigate above {format_bot_path(floor, floor)}",
-        )
-        return
-    if not os.path.isdir(target):
-        await update.message.reply_text(f"Not a directory: {format_bot_path(target, floor)}")
-        return
-    text, markup = _build_nav(target, 0, floor)
-    await update.message.reply_text(text, reply_markup=markup)
+cmd_ls = cmd_nav  # /ls is an alias for /cd — both open the interactive browser
 
 
 # ── Message + Photo Handlers ─────────────────────────────────────────
@@ -1484,6 +1518,8 @@ def main() -> None:
     )
 
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("readme", cmd_readme))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("haiku", cmd_haiku))
     app.add_handler(CommandHandler("sonnet", cmd_sonnet))
@@ -1491,9 +1527,9 @@ def main() -> None:
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("cd", cmd_cd))
+    app.add_handler(CommandHandler("cd", cmd_nav))
+    app.add_handler(CommandHandler("ls", cmd_nav))
     app.add_handler(CommandHandler("pwd", cmd_pwd))
-    app.add_handler(CommandHandler("ls", cmd_ls))
     app.add_handler(CommandHandler("clone", cmd_clone))
     app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
