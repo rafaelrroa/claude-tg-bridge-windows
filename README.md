@@ -1,201 +1,222 @@
-# Claude Telegram Bridge
+<p align="center">
+  <h1 align="center">Claude Telegram Bridge</h1>
+  <p align="center">
+    Turn any Telegram chat into a full Claude Code workspace — with streaming, sessions, and filesystem access.
+  </p>
+</p>
 
-A Telegram bot that bridges users to Claude AI via the [Claude CLI](https://docs.anthropic.com/en/docs/claude-code). It spawns Claude CLI subprocesses with streaming JSON output, manages per-user sessions in SQLite, and relays responses back to Telegram in real time.
+<p align="center">
+  <a href="#quick-start"><img src="https://img.shields.io/badge/quick%20start-3%20steps-brightgreen" alt="Quick Start"></a>
+  <img src="https://img.shields.io/badge/python-3.11+-blue" alt="Python 3.11+">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux-lightgrey" alt="Platform">
+  <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
+  <img src="https://img.shields.io/badge/single%20file-~1750%20lines-orange" alt="Single file">
+</p>
 
-## Features
+> Fork of [indoor47/claude-tg-bridge](https://github.com/indoor47/claude-tg-bridge) — extended with Windows support, forum topics, interactive navigation, context-aware permissions, and security hardening.
 
-- **Streaming responses** — only Claude's final output is sent; no intermediate noise
-- **Session management** — multiple named sessions per conversation, persisted in SQLite
-- **Image support** — send photos; albums are batched into a single Claude call
-- **Interactive filesystem navigation** — `/cd` shows inline buttons to browse directories; each chat is sandboxed to its own floor, displayed as `claude-bot:/`
-- **Forum topic support** — hub-and-spoke model: General topic = management hub, sub-topics = isolated Claude workspaces
-- **Context-aware permissions** — commands are scoped: management commands in the hub, session commands inside topics
-- **Repository cloning** — `/clone <url>` clones a GitHub repo and immediately opens a new topic/session in it
-- **External session attach** — `/resume <id>` attaches a Claude CLI session started outside the bot
-- **Model switching** — switch between Haiku, Sonnet, and Opus per topic
-- **Access control** — allowlist by Telegram user ID and/or chat ID
-- **Windows + Linux** — runs natively on both; systemd unit included for Linux
+---
 
-## Requirements
+A single-file Telegram bot that spawns [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) subprocesses, streams responses in real time, and gives each Telegram topic its own isolated Claude session with filesystem access.
 
-- Python 3.11+
-- [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude --version` should work)
-- A Telegram Bot token (from [@BotFather](https://t.me/BotFather))
-
-## Installation
-
-```bash
-git clone https://github.com/your-user/claude-tg-bridge-windows
-cd claude-tg-bridge-windows
-
-pip install -r requirements.txt
-
-cp .env.example .env
-# Edit .env — set TELEGRAM_BOT_TOKEN, ALLOWED_USERS, ALLOWED_CHATS, WORKING_DIR
+```
+You (Telegram)              Claude Bridge                Claude CLI
+┌──────────┐    /clone     ┌─────────────┐  subprocess  ┌──────────┐
+│  General  │───────────►  │  bridge.py  │────────────► │  claude  │
+│  topic    │   /cd /new   │  (asyncio)  │◄────────────┐│  --print │
+└──────────┘               └─────────────┘  stream-json ││  --model │
+      │                          │                      │└──────────┘
+      ▼                          ▼                      │
+┌──────────┐               ┌──────────┐                 │
+│ myrepo   │◄──────────────│ SQLite   │  sessions,      │
+│ topic    │  streamed     │ sessions │  prefs, dirs     │
+└──────────┘  responses    └──────────┘                  │
 ```
 
-## Configuration
+## Why?
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | **Yes** | — | Bot token from @BotFather |
-| `ALLOWED_USERS` | **Yes** | — | Comma-separated Telegram user IDs allowed to use the bot |
-| `ALLOWED_CHATS` | No | _(empty — blocks all groups)_ | Comma-separated group/supergroup IDs to allow |
-| `WORKING_DIR` | No | `~` (home dir) | Bot root directory — the top of the `claude-bot:/` filesystem |
-| `BRIDGE_DB` | No | `sessions.db` | SQLite database path |
-| `LOG_DIR` | No | `.` | Directory for rotating log files |
+Claude CLI is powerful, but it lives in your terminal. This bridge lets you:
 
-> **Security note:** If `ALLOWED_CHATS` is empty, the bot blocks all group/supergroup access. Only private chats with users in `ALLOWED_USERS` will work.
+- **Chat with Claude from anywhere** — your phone, tablet, or any device with Telegram
+- **Manage multiple projects** — each Telegram topic is an isolated workspace with its own session, model, and working directory
+- **Keep full CLI capabilities** — Claude can read, write, and execute code through the same tools as the CLI (Bash, Read, Edit, Grep, etc.)
+- **Resume sessions across devices** — start a session on your laptop's CLI, resume it from your phone via `/resume`
 
-## Running
+No web server, no API proxy, no cloud deployment needed. Just a single Python file running alongside Claude CLI.
+
+## Quick Start
+
+**Prerequisites:** Python 3.11+, [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated, a [Telegram Bot token](https://t.me/BotFather).
+
+```bash
+git clone https://github.com/rafaelrroa/claude-tg-bridge-windows
+cd claude-tg-bridge-windows
+pip install -r requirements.txt
+```
+
+```bash
+cp .env.example .env
+# Edit .env — set TELEGRAM_BOT_TOKEN and ALLOWED_USERS (your Telegram user ID)
+```
 
 ```bash
 python bridge.py
 ```
 
+That's it. Message your bot on Telegram and start chatting with Claude.
+
+## Features
+
+- **Streaming responses** — Claude's output is streamed live to Telegram, flushed every 3 seconds
+- **Forum topic support** — hub-and-spoke model: General topic = management hub, sub-topics = isolated Claude workspaces
+- **Session management** — auto-resume, `/history` to browse past sessions, `/new` to start fresh
+- **Interactive filesystem navigation** — `/cd` shows inline buttons to browse and navigate directories
+- **Image support** — send photos or albums; they're batched and analyzed by Claude
+- **Context-aware commands** — management commands in the hub, session commands inside topics
+- **Repository cloning** — `/clone <url>` clones a repo and opens a new topic in it
+- **External session attach** — `/resume <id>` picks up a Claude CLI session started elsewhere
+- **Model switching** — `/haiku`, `/sonnet`, `/opus` per topic, mid-conversation
+- **Access control** — allowlist by user ID and chat ID; groups blocked by default
+- **Cross-platform** — Windows and Linux; systemd service unit included
+
+## Configuration
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | **Yes** | — | Bot token from [@BotFather](https://t.me/BotFather) |
+| `ALLOWED_USERS` | **Yes** | — | Comma-separated Telegram user IDs |
+| `ALLOWED_CHATS` | No | _(empty — blocks all groups)_ | Comma-separated group/supergroup IDs |
+| `WORKING_DIR` | No | `~` | Bot root directory (top of `claude-bot:/`) |
+| `BRIDGE_DB` | No | `sessions.db` | SQLite database path |
+| `LOG_DIR` | No | `.` | Directory for rotating log files |
+
+> **Security:** If `ALLOWED_CHATS` is empty, the bot blocks all group/supergroup access. Only private chats with users in `ALLOWED_USERS` will work.
+
 ## Telegram Setup
 
 ### 1. Create the bot
 
-1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+1. Message [@BotFather](https://t.me/BotFather) on Telegram
 2. Send `/newbot` and follow the prompts
-3. Copy the token and set it as `TELEGRAM_BOT_TOKEN` in your `.env`
+3. Copy the token into `TELEGRAM_BOT_TOKEN` in your `.env`
 
-### 2. Create a Supergroup with Topics (Forum mode) — recommended
-
-Forum mode lets each repository/project live in its own topic with isolated session, model, and working directory.
-
-1. Create a new Telegram group
-2. Open group **Settings → Edit → Topics** and enable it — the group becomes a *Supergroup with Topics*
-3. Add your bot to the group as an **Administrator** with **Manage Topics** permission (needed to create and close topics programmatically)
-4. Get the group's numeric ID:
-   - Forward any message from the group to [@userinfobot](https://t.me/userinfobot), or
-   - Use [@RawDataBot](https://t.me/RawDataBot) — it shows `chat.id` for group messages
-   - The ID is negative, e.g. `-1001234567890`
-5. Add it to `ALLOWED_CHATS` in your `.env`:
-   ```
-   ALLOWED_CHATS=-1001234567890
-   ```
-6. Restart the bot
-
-### 3. Find your user ID
+### 2. Find your user ID
 
 Send any message to [@userinfobot](https://t.me/userinfobot) — it replies with your numeric user ID. Add it to `ALLOWED_USERS`.
 
-## Bot Commands
+### 3. Enable Forum mode (recommended)
 
-Commands are context-aware — available commands differ between the management hub and project topics.
+Forum mode gives each project its own topic with an isolated session, model, and working directory.
+
+1. Create a Telegram group
+2. **Settings > Edit > Topics** — enable it (the group becomes a Supergroup with Topics)
+3. Add your bot as an **Administrator** with **Manage Topics** permission
+4. Get the group's numeric ID:
+   - Forward a message from the group to [@userinfobot](https://t.me/userinfobot), or
+   - Use [@RawDataBot](https://t.me/RawDataBot) — look for `chat.id`
+   - The ID is negative, e.g. `-1001234567890`
+5. Add it to `ALLOWED_CHATS` in `.env` and restart the bot
+
+## Commands
+
+Commands are context-aware — different commands are available in different chat types.
 
 ### Main chat / General topic (management hub)
 
 | Command | Description |
 |---|---|
-| `/cd [path]` | Navigate filesystem with interactive folder buttons |
-| `/pwd` | Show current directory as `claude-bot:/path` |
-| `/new [folder]` | Open a project folder as a new topic. Without args, uses the current `/cd` directory |
-| `/clone <url>` | Clone a GitHub repo into the root and open a new topic in it |
-| `/resume <id>` | Navigate to the project with `/cd` first, then attach an external CLI session (creates a new topic) |
-| `/status` | Current model, session, running state, uptime, working dir |
-| `/help` | List all commands |
+| `/cd [path]` | Navigate filesystem with interactive buttons |
+| `/pwd` | Show current directory |
+| `/new [folder]` | Open a project folder as a new topic |
+| `/clone <url>` | Clone a GitHub repo and open a topic in it |
+| `/resume <id>` | Attach a CLI session (navigate with `/cd` first) |
+| `/status` | Model, session, uptime, working dir |
+| `/help` | Command list |
 | `/readme` | In-chat usage guide |
 
 ### Inside a topic (Claude workspace)
 
 | Command | Description |
 |---|---|
-| _(any message)_ | Send to Claude — response streamed back |
-| `/stop` | Cancel the running Claude process, clear the queue, and **close this topic** (read-only) |
-| `/history` | Browse past sessions for this topic; tap to resume |
-| `/resume <id>` | Attach an external CLI session to this topic |
-| `/haiku` | Switch to Claude Haiku |
-| `/sonnet` | Switch to Claude Sonnet |
-| `/opus` | Switch to Claude Opus |
-| `/pwd` | Show current directory as `claude-bot:/path` |
+| _(any message)_ | Send to Claude — streamed back live |
+| `/stop` | Cancel + close this topic |
+| `/history` | Browse and resume past sessions |
+| `/resume <id>` | Attach an external CLI session |
+| `/haiku` `/sonnet` `/opus` | Switch model |
+| `/pwd` | Show current directory |
 
 ### Private chat
 
-All commands from both tables are available. `/stop` cancels the process but does not close anything.
+All commands from both tables are available. `/stop` cancels the process but doesn't close anything.
 
-## Usage Guide
-
-### Private chat
-
-Send any message — Claude responds with its full output. No status messages appear; only the final result is shown. All commands are available.
-
-### Forum / Supergroup Topics — hub-and-spoke model
-
-**General topic (management hub):**
-- Navigate the filesystem with `/cd` — shown as `claude-bot:/`
-- Open project topics with `/new` (uses current `/cd` dir) or `/clone <url>`
-- Attach external CLI sessions with `/resume <id>` (navigate to the project first)
-- Claude is **not active** here — plain messages are redirected with a hint
-- Model and session commands are disabled (they belong to topics)
-
-**Project topics (Claude workspaces):**
-- Each topic has its own Claude session, model, and working directory
-- The working directory is locked to the project folder (`claude-bot:/` within that topic)
-- Full Claude functionality: chat, images, session history, model switching
-- `/stop` cancels any running task and closes the topic (makes it read-only)
+## Usage
 
 ### Typical workflow
 
 ```
-General topic:  /cd myproject          ← navigate to project
-General topic:  /new                   ← creates topic "myproject"
-  myproject topic:  ask Claude anything
-  myproject topic:  /stop              ← closes topic when done
+General topic:  /cd myproject       ← navigate to a project
+General topic:  /new                ← creates topic "myproject"
+
+  myproject topic:  fix the login bug
+  myproject topic:  now add tests for it
+  myproject topic:  /stop           ← done — closes the topic
 ```
 
-Or with a remote repo:
+Or clone a remote repo:
 
 ```
-General topic:  /clone https://github.com/user/myrepo
-  myrepo topic:  ask Claude anything
-  myrepo topic:  /stop
+General topic:  /clone https://github.com/user/repo
+
+  repo topic:  explain the architecture
+  repo topic:  /stop
 ```
 
-### Attaching an external CLI session
+### Attach an external CLI session
 
-If you started a Claude session outside the bot, you can attach it:
+Start a Claude session on your machine, then pick it up from Telegram:
 
 ```
 General topic:  /cd myproject
-General topic:  /resume <session-uuid>   ← verifies session exists in ~/.claude/projects/
-  myproject topic: session ready, send messages
+General topic:  /resume abc12345-1234-5678-9abc-def012345678
+
+  myproject topic:  (session ready — continue where you left off)
 ```
 
-Find your session UUID in the Claude CLI output or in `~/.claude/projects/<encoded-path>/`.
+### Interactive navigation
 
-### Interactive filesystem navigation
-
-`/cd` shows an inline keyboard instead of plain text:
+`/cd` shows an inline keyboard:
 
 ```
-📁 claude-bot:/myproject
+ claude-bot:/myproject
   3 folders, 12 files
 
-  📄 main.py
-  📄 README.md
+   main.py
+   README.md
 
-[ ⬆️ .. ]
-[ 📁 src ]
-[ 📁 tests ]
-[ 📁 docs ]
+[ .. ]
+[  src ]
+[  tests ]
+[  docs ]
 ```
 
-- Tap a folder button to navigate into it (updates the working directory)
-- The `⬆️ ..` button goes up one level — it disappears at the chat's root (`claude-bot:/`)
-- If a directory has more than 8 subfolders, pagination buttons appear: `◀️ Prev · 1/N · Next ▶️`
+Tap a folder to navigate. The `..` button disappears at your root (`claude-bot:/`). Pagination appears for 8+ subfolders.
 
-### Session management
+### Message queueing
 
-- Each conversation auto-resumes its last session; use `/new` to start fresh
-- `/history` shows up to 15 past sessions as tappable buttons — tap one to resume it
-- `/status` shows the active session ID, model, and runtime info (main chat only)
+If Claude is busy, messages are queued and processed in order. `/stop` cancels the current task and flushes the queue.
 
-### Queueing
+## Architecture
 
-If Claude is busy, new messages are queued automatically and processed in order. Send `/stop` to cancel the current task and flush the queue.
+All logic lives in a single file (`bridge.py`, ~1750 lines). No build step, no external services.
+
+| Component | Detail |
+|---|---|
+| **Concurrency** | Atomic busy flag on asyncio's event loop — no `await` between check and set |
+| **Streaming** | Reads `stream-json` stdout, buffers text, flushes to Telegram every 3s |
+| **Sandboxing** | Each chat has a navigation floor in SQLite; `/cd` cannot escape it |
+| **Permissions** | Three contexts (private / foundational / topic) detected from Telegram metadata |
+| **Process isolation** | `start_new_session` (Linux) / `CREATE_NEW_PROCESS_GROUP` (Windows) |
+| **Storage** | SQLite with two tables: `sessions` and `user_prefs` |
 
 ## Running as a Service (Linux)
 
@@ -206,23 +227,18 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now claude-bridge
 ```
 
-## Architecture
+## Contributing
 
-```
-Telegram update → handler → per-user async queue → Claude subprocess (stream-json) → Telegram reply
-```
+Contributions are welcome. The project is a single file (`bridge.py`) — no build system or test framework to learn.
 
-All logic lives in a single file (`bridge.py`, ~1750 lines). No build step, no test suite.
+1. Fork the repository
+2. Create a feature branch (`git checkout -b my-feature`)
+3. Make your changes
+4. Test manually by running `python bridge.py` and interacting via Telegram
+5. Commit with a descriptive message (`git commit -m "feat: add dark mode support"`)
+6. Push and open a Pull Request
 
-**Concurrency:** Atomic busy flag on asyncio's single-threaded event loop — no `await` between checking and setting `busy`, preventing race conditions when messages arrive faster than Claude responds.
-
-**Streaming:** Reads Claude's `stream-json` stdout line-by-line, buffers text, and flushes to Telegram every 3 seconds or on tool-use events. Only the final accumulated text is delivered to the user.
-
-**Sandboxing:** Each chat has a navigation *floor* stored in SQLite (`home_dir` column). The foundational chat's floor is `WORKING_DIR` (`claude-bot:/`); topic and private chats are locked to the folder they were opened with. `/cd` and folder buttons cannot navigate above the floor.
-
-**Context-aware permissions:** Three chat contexts are detected from Telegram metadata (`chat.type`, `chat.is_forum`, `message.message_thread_id`): private chats (all commands), foundational/General topic (management commands), and forum sub-topics (session commands). Commands outside their allowed context return a redirect hint.
-
-**Process isolation:** Subprocesses are spawned with `start_new_session=True` (Linux) or `CREATE_NEW_PROCESS_GROUP` (Windows). stderr goes to DEVNULL to avoid pipe buffer overflow. `process.wait()` has a 5-second timeout with kill fallback.
+**Reporting issues:** Open an issue describing the problem, expected behavior, and steps to reproduce.
 
 ## License
 
