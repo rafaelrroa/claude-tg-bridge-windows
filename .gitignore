@@ -1,5 +1,4 @@
 .env
-CLAUDE.md
 *.db
 __pycache__/
 *.pyc
