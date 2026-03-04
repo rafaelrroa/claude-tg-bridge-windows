@@ -9,12 +9,12 @@ A Telegram bot that bridges users to Claude AI via the Claude CLI. Single-file P
 ## Running
 
 ```bash
-pip install -r requirements.txt   # only dependency: python-telegram-bot>=21.0
-cp .env.example .env              # configure TELEGRAM_BOT_TOKEN and ALLOWED_USERS
+pip install -r requirements.txt   # dependencies: python-telegram-bot>=21.0, python-dotenv>=1.0
+cp .env.example .env              # configure TELEGRAM_BOT_TOKEN and ALLOWED_USERS (both required)
 python bridge.py                  # starts polling
 ```
 
-Environment variables: `TELEGRAM_BOT_TOKEN` (required), `ALLOWED_USERS` (comma-separated Telegram user IDs), `WORKING_DIR` (default cwd for Claude), `BRIDGE_DB` (SQLite path, default `sessions.db`), `LOG_DIR` (default `.`).
+Environment variables: `TELEGRAM_BOT_TOKEN` (required), `ALLOWED_USERS` (required, comma-separated Telegram user IDs — bot exits if empty), `WORKING_DIR` (default cwd for Claude), `BRIDGE_DB` (SQLite path, default `sessions.db`), `LOG_DIR` (default `.`).
 
 ## Architecture
 
@@ -34,7 +34,7 @@ The bot uses an **atomic busy flag** on asyncio's single-threaded event loop ins
 @dataclass
 class UserState:
     process: asyncio.subprocess.Process | None = None
-    queue: list[str] = field(default_factory=list)
+    queue: collections.deque[str] = field(default_factory=collections.deque)
     cancelled: bool = False
     busy: bool = False
 ```
@@ -53,10 +53,13 @@ Photo albums are buffered for 1.5s to batch multiple images into a single Claude
 
 ### Process lifecycle
 
-- Subprocesses are spawned with `start_new_session=True` (process group isolation)
+- Subprocesses are spawned with `start_new_session=True` (Linux) or `CREATE_NEW_PROCESS_GROUP` (Windows)
 - stderr is sent to DEVNULL to avoid 64KB pipe buffer overflow
 - `process.wait()` has a 5-second timeout with kill fallback
+- Process trees killed via `subprocess.run(["taskkill", ...])` (Windows) or `os.killpg()` (Linux)
 - Graceful shutdown kills all process groups on SIGTERM/SIGINT
+- DB connections use `try/finally` to prevent leaks on errors
+- Stale temp images (>1h) cleaned on startup
 
 ## Bot commands
 

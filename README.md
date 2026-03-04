@@ -22,15 +22,15 @@ A single-file Telegram bot that spawns [Claude CLI](https://docs.anthropic.com/e
 ```
 You (Telegram)              Claude Bridge                Claude CLI
 ┌──────────┐    /clone     ┌─────────────┐  subprocess  ┌──────────┐
-│  General  │───────────►  │  bridge.py  │────────────► │  claude  │
-│  topic    │   /cd /new   │  (asyncio)  │◄────────────┐│  --print │
-└──────────┘               └─────────────┘  stream-json ││  --model │
-      │                          │                      │└──────────┘
-      ▼                          ▼                      │
-┌──────────┐               ┌──────────┐                 │
-│ myrepo   │◄──────────────│ SQLite   │  sessions,      │
-│ topic    │  streamed     │ sessions │  prefs, dirs     │
-└──────────┘  responses    └──────────┘                  │
+│  General │─────────────► │  bridge.py  │────────────► │  claude  │
+│  topic   │    /cd /new   │  (asyncio)  │◄────────────┐│  --print │
+└──────────┘               └─────────────┘  stream-json │  --model │
+      │                          │                      └──────────┘
+      ▼                          ▼                      
+┌──────────┐               ┌──────────┐                 
+│ myrepo   │◄──────────────│ SQLite   │  sessions,      
+│ topic    │  streamed     │ sessions │  prefs, dirs     
+└──────────┘  responses    └──────────┘                  
 ```
 
 ## Why?
@@ -81,14 +81,14 @@ That's it. Message your bot on Telegram and start chatting with Claude.
 
 ## Configuration
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | **Yes** | — | Bot token from [@BotFather](https://t.me/BotFather) |
-| `ALLOWED_USERS` | **Yes** | — | Comma-separated Telegram user IDs |
-| `ALLOWED_CHATS` | No | _(empty — blocks all groups)_ | Comma-separated group/supergroup IDs |
-| `WORKING_DIR` | No | `~` | Bot root directory (top of `claude-bot:/`) |
-| `BRIDGE_DB` | No | `sessions.db` | SQLite database path |
-| `LOG_DIR` | No | `.` | Directory for rotating log files |
+| Variable             | Required | Default                       | Description                                         |
+| -------------------- | -------- | ----------------------------- | --------------------------------------------------- |
+| `TELEGRAM_BOT_TOKEN` | **Yes**  | —                             | Bot token from [@BotFather](https://t.me/BotFather) |
+| `ALLOWED_USERS`      | **Yes**  | —                             | Comma-separated Telegram user IDs                   |
+| `ALLOWED_CHATS`      | No       | _(empty — blocks all groups)_ | Comma-separated group/supergroup IDs                |
+| `WORKING_DIR`        | No       | `~`                           | Bot root directory (top of `claude-bot:/`)          |
+| `BRIDGE_DB`          | No       | `sessions.db`                 | SQLite database path                                |
+| `LOG_DIR`            | No       | `.`                           | Directory for rotating log files                    |
 
 > **Security:** If `ALLOWED_CHATS` is empty, the bot blocks all group/supergroup access. Only private chats with users in `ALLOWED_USERS` will work.
 
@@ -123,27 +123,27 @@ Commands are context-aware — different commands are available in different cha
 
 ### Main chat / General topic (management hub)
 
-| Command | Description |
-|---|---|
-| `/cd [path]` | Navigate filesystem with interactive buttons |
-| `/pwd` | Show current directory |
-| `/new [folder]` | Open a project folder as a new topic |
-| `/clone <url>` | Clone a GitHub repo and open a topic in it |
-| `/resume <id>` | Attach a CLI session (navigate with `/cd` first) |
-| `/status` | Model, session, uptime, working dir |
-| `/help` | Command list |
-| `/readme` | In-chat usage guide |
+| Command         | Description                                      |
+| --------------- | ------------------------------------------------ |
+| `/cd [path]`    | Navigate filesystem with interactive buttons     |
+| `/pwd`          | Show current directory                           |
+| `/new [folder]` | Open a project folder as a new topic             |
+| `/clone <url>`  | Clone a GitHub repo and open a topic in it       |
+| `/resume <id>`  | Attach a CLI session (navigate with `/cd` first) |
+| `/status`       | Model, session, uptime, working dir              |
+| `/help`         | Command list                                     |
+| `/readme`       | In-chat usage guide                              |
 
 ### Inside a topic (Claude workspace)
 
-| Command | Description |
-|---|---|
-| _(any message)_ | Send to Claude — streamed back live |
-| `/stop` | Cancel + close this topic |
-| `/history` | Browse and resume past sessions |
-| `/resume <id>` | Attach an external CLI session |
-| `/haiku` `/sonnet` `/opus` | Switch model |
-| `/pwd` | Show current directory |
+| Command                    | Description                         |
+| -------------------------- | ----------------------------------- |
+| _(any message)_            | Send to Claude — streamed back live |
+| `/stop`                    | Cancel + close this topic           |
+| `/history`                 | Browse and resume past sessions     |
+| `/resume <id>`             | Attach an external CLI session      |
+| `/haiku` `/sonnet` `/opus` | Switch model                        |
+| `/pwd`                     | Show current directory              |
 
 ### Private chat
 
@@ -209,14 +209,14 @@ If Claude is busy, messages are queued and processed in order. `/stop` cancels t
 
 All logic lives in a single file (`bridge.py`, ~1750 lines). No build step, no external services.
 
-| Component | Detail |
-|---|---|
-| **Concurrency** | Atomic busy flag on asyncio's event loop — no `await` between check and set |
-| **Streaming** | Reads `stream-json` stdout, buffers text, flushes to Telegram every 3s |
-| **Sandboxing** | Each chat has a navigation floor in SQLite; `/cd` cannot escape it |
-| **Permissions** | Three contexts (private / foundational / topic) detected from Telegram metadata |
-| **Process isolation** | `start_new_session` (Linux) / `CREATE_NEW_PROCESS_GROUP` (Windows) |
-| **Storage** | SQLite with two tables: `sessions` and `user_prefs` |
+| Component             | Detail                                                                          |
+| --------------------- | ------------------------------------------------------------------------------- |
+| **Concurrency**       | Atomic busy flag on asyncio's event loop — no `await` between check and set     |
+| **Streaming**         | Reads `stream-json` stdout, buffers text, flushes to Telegram every 3s          |
+| **Sandboxing**        | Each chat has a navigation floor in SQLite; `/cd` cannot escape it              |
+| **Permissions**       | Three contexts (private / foundational / topic) detected from Telegram metadata |
+| **Process isolation** | `start_new_session` (Linux) / `CREATE_NEW_PROCESS_GROUP` (Windows)              |
+| **Storage**           | SQLite with two tables: `sessions` and `user_prefs`                             |
 
 ## Running as a Service (Linux)
 
